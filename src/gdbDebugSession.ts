@@ -14,6 +14,9 @@ export interface SnapshotData {
         addr: string;
         poll: number;
         state: number | string;
+        file?: string;
+        fullname?: string;
+        line?: number;
     }>;
 }
 

@@ -17,6 +17,10 @@ PRINT_INTERNAL_POLL_HITS = True
 PRINT_WHITELIST_ADDR_STATS = True
 
 
+# Regex to parse GDB's "info line" output:
+# e.g. 'Line 42 of "src/main.rs" starts at address ...'
+_re_info_line = re.compile(r'Line\s+(\d+)\s+of\s+"([^"]+)"')
+
 # -------------------------
 # Coroutine instance tracking (runtime)
 # -------------------------
@@ -784,13 +788,31 @@ class ARDGetSnapshotCommand(gdb.Command):
                 except Exception:
                     pass
 
+            # Try to get source location for this async function
+            async_file = ""
+            async_fullname = ""
+            async_line = 0
+            try:
+                info = gdb.execute(f"info line '{poll_sym}'", to_string=True)
+                m = _re_info_line.match(info)
+                if m:
+                    async_line = int(m.group(1))
+                    async_file = m.group(2)
+                    # Try to resolve absolute path
+                    async_fullname = os.path.abspath(async_file) if async_file else ""
+            except Exception:
+                pass
+
             snapshot["path"].append({
                 "type": "async",
                 "cid": cid,
                 "func": poll_sym,
                 "addr": hex(this_ptr),
                 "poll": seq,
-                "state": state_val
+                "state": state_val,
+                "file": async_file,
+                "fullname": async_fullname,
+                "line": async_line
             })
             
         # 2. Extract the synchronous tail (Physical frames above the top coroutine)
@@ -807,13 +829,29 @@ class ARDGetSnapshotCommand(gdb.Command):
                     break
                 
                 if fname:
+                    # Get source location from the frame
+                    sync_file = ""
+                    sync_fullname = ""
+                    sync_line = 0
+                    try:
+                        sal = frame.find_sal()
+                        if sal and sal.symtab:
+                            sync_file = sal.symtab.filename or ""
+                            sync_fullname = sal.symtab.fullname() if hasattr(sal.symtab, 'fullname') else sync_file
+                            sync_line = sal.line or 0
+                    except Exception:
+                        pass
+
                     sync_tail.append({
                         "type": "sync",
                         "cid": None,
                         "func": fname,
                         "addr": hex(frame.pc()),
                         "poll": 0,
-                        "state": "NON-ASYNC"
+                        "state": "NON-ASYNC",
+                        "file": sync_file,
+                        "fullname": sync_fullname,
+                        "line": sync_line
                     })
                 frame = frame.older()
         except Exception:

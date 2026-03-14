@@ -262,7 +262,21 @@ class AsyncInspectorPanel {
             return;
         }
         try {
-            const uri = vscode.Uri.file(file);
+            // GDB may return relative paths (e.g. "src/main.rs").
+            // Resolve them against the workspace folder to get an absolute path.
+            let uri;
+            if (file.startsWith('/')) {
+                uri = vscode.Uri.file(file);
+            }
+            else {
+                const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
+                if (workspaceFolder) {
+                    uri = vscode.Uri.joinPath(workspaceFolder, file);
+                }
+                else {
+                    uri = vscode.Uri.file(file);
+                }
+            }
             const doc = await vscode.workspace.openTextDocument(uri);
             const targetLine = Math.max(0, line - 1); // VS Code lines are 0-based
             await vscode.window.showTextDocument(doc, {

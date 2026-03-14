@@ -257,8 +257,9 @@ function handleThreads(request: any): void {
 
 /**
  * Handle "stackTrace" request.
- * Queries GDB for the call stack of the given thread and returns
- * DAP StackFrame objects with source location info.
+ * First attempts to get the async logical call stack via ardb-get-snapshot.
+ * If a valid snapshot exists, returns logical stack frames (async + sync).
+ * Otherwise, falls back to GDB's physical stack frames (-stack-list-frames).
  */
 function handleStackTrace(request: any): void {
     const threadId = request.arguments?.threadId || 1;
@@ -269,9 +270,105 @@ function handleStackTrace(request: any): void {
         return;
     }
 
-    // Switch to the requested thread, then list frames
+    // Switch to the requested thread, then try to get a logical snapshot
     sendMICommand(`-thread-select ${threadId}`)
-        .then(() => sendMICommand('-stack-list-frames'))
+        .then(() => {
+            // Try to get async snapshot for logical call stack
+            const escaped = 'ardb-get-snapshot';
+            return sendMICommand(`-interpreter-exec console "${escaped}"`);
+        })
+        .then((record) => {
+            const output = record.data?.msg || '';
+            const snapshot = parseSnapshot(output);
+
+            if (snapshot && snapshot.path.length > 0) {
+                // Build logical stack frames from snapshot
+                // Snapshot path is root→leaf (caller→callee), but VS Code
+                // expects leaf→root (top of stack first), so reverse it.
+                const reversedPath = [...snapshot.path].reverse();
+                const stackFrames: any[] = [];
+
+                for (let i = 0; i < reversedPath.length; i++) {
+                    const node = reversedPath[i];
+                    const frameId = threadId * 10000 + i;
+
+                    let name: string;
+                    if (node.type === 'async') {
+                        name = `[async CID:${node.cid}] ${node.func}`;
+                    } else {
+                        name = node.func || '<unknown>';
+                    }
+
+                    const frame: any = {
+                        id: frameId,
+                        name,
+                        line: node.line || 0,
+                        column: 0,
+                    };
+
+                    if (node.fullname || node.file) {
+                        frame.source = {
+                            name: node.file || '',
+                            path: node.fullname || node.file || '',
+                        };
+                    }
+
+                    if (node.addr) {
+                        frame.instructionPointerReference = node.addr;
+                    }
+
+                    stackFrames.push(frame);
+                }
+
+                sendResponse(request, {
+                    stackFrames,
+                    totalFrames: stackFrames.length,
+                });
+            } else {
+                // Fallback to physical GDB stack frames
+                return fallbackPhysicalStackTrace(request, threadId);
+            }
+        })
+        .catch((err) => {
+            process.stderr.write(`[Adapter] snapshot stackTrace failed, falling back: ${err.message}\n`);
+            // Fallback on error
+            fallbackPhysicalStackTrace(request, threadId).catch((err2) => {
+                process.stderr.write(`[Adapter] stackTrace fallback also failed: ${err2.message}\n`);
+                sendResponse(request, { stackFrames: [], totalFrames: 0 });
+            });
+        });
+}
+
+/**
+ * Parse a snapshot JSON from GDB console output.
+ * Returns the parsed snapshot or undefined if parsing fails.
+ */
+function parseSnapshot(output: string): { thread_id: number; path: Array<{ type: string; cid: number | null; func: string; addr: string; poll: number; state: number | string; file?: string; fullname?: string; line?: number }> } | undefined {
+    if (!output) return undefined;
+
+    const jsonStart = output.indexOf('{');
+    const jsonEnd = output.lastIndexOf('}');
+    if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+        return undefined;
+    }
+
+    try {
+        const jsonStr = output.substring(jsonStart, jsonEnd + 1);
+        const snapshot = JSON.parse(jsonStr);
+        if (snapshot.thread_id !== undefined && Array.isArray(snapshot.path)) {
+            return snapshot;
+        }
+    } catch {
+        // JSON parse failed
+    }
+    return undefined;
+}
+
+/**
+ * Fallback: query GDB for physical stack frames via -stack-list-frames.
+ */
+function fallbackPhysicalStackTrace(request: any, threadId: number): Promise<void> {
+    return sendMICommand('-stack-list-frames')
         .then((record) => {
             const stackFrames: any[] = [];
             const miStack = record.data?.stack;
