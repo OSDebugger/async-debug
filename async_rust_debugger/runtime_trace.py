@@ -56,6 +56,24 @@ def _get_or_make_coro_id(poll_sym: str, this_ptr: int):
         return cid, True
     return cid, False
 
+
+def _find_nearby_coro(poll_sym: str, this_ptr: int, max_offset: int = 128) -> int | None:
+    """
+    Search for an existing CID whose (poll_sym, stored_ptr) has the same
+    poll_sym and a stored_ptr within ±max_offset of this_ptr.
+
+    This handles the case where Pin/reference wrapping introduces a small
+    pointer offset for the same underlying coroutine instance.
+
+    Returns the matching CID, or None if no nearby match is found.
+    """
+    if not this_ptr:
+        return None
+    for (sym, stored_ptr), cid in _CO_BY_KEY.items():
+        if sym == poll_sym and abs(int(stored_ptr) - int(this_ptr)) <= max_offset:
+            return cid
+    return None
+
 def _push_coro(cid: int) -> int:
     tid = _thread_id()
     st = _TLS_STACK.setdefault(tid, [])
@@ -250,6 +268,53 @@ def _pollsym_to_envtype(poll_sym: str) -> str | None:
     s = s.replace("{async_fn#", "{async_fn_env#")
     s = s.replace("{async_block#", "{async_block_env#")
     return s if s != poll_sym else None
+
+
+def _read_env_state(poll_sym: str, this_ptr: int):
+    """
+    Read the state discriminant from an async env struct.
+
+    Returns a value suitable for the snapshot 'state' field:
+      - An integer (the raw __state discriminant) if readable
+      - A string like "N/A" if the env type can't be resolved
+      - Falls back to reading the first field of the env struct
+        if __state is not present (e.g. manual Future impls)
+    """
+    if not this_ptr:
+        return "N/A"
+
+    env_type_name = _pollsym_to_envtype(poll_sym)
+    if not env_type_name:
+        return "N/A"
+
+    try:
+        env_t = gdb.lookup_type(env_type_name)
+        env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
+
+        # Primary: try the well-known __state field
+        try:
+            return int(env_val["__state"])
+        except Exception:
+            pass
+
+        # Fallback: read the first field as discriminant
+        # (common for manually implemented futures where the first
+        #  field is often a bool or enum indicating completion)
+        try:
+            fields = env_t.fields()
+            if fields:
+                first_val = env_val[fields[0].name]
+                first_code = first_val.type.strip_typedefs().code
+                if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL,
+                                  gdb.TYPE_CODE_ENUM):
+                    return int(first_val)
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return "N/A"
 
 def _try_read_awaitee_from_current_poll(poll_sym: str):
     env_type_name = _pollsym_to_envtype(poll_sym)
@@ -494,6 +559,62 @@ def _load_async_symbol_set_from_grouped():
         _ASYNC_SYMBOL_SET = async_set
     except Exception:
         pass
+
+
+def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
+    """
+    Recursively unwrap a GDB value to extract the raw memory address.
+
+    Handles common Rust wrapper types:
+      - Pin<P>      → struct with '__pointer' or 'pointer' field
+      - Box<T>      → struct with 'pointer' field (Unique) containing '*mut T'
+      - &mut T / &T → TYPE_CODE_REF / TYPE_CODE_RVALUE_REF
+      - *mut T / *const T → TYPE_CODE_PTR
+      - Unique<T>   → struct with 'pointer' field (NonNull) → inner '*const T'
+      - NonNull<T>  → struct with 'pointer' field → '*const T'
+
+    Recursion depth is capped to avoid infinite loops on pathological types.
+    """
+    if depth > 8:
+        return int(val) if val else 0
+
+    try:
+        ty = val.type.strip_typedefs()
+        code = ty.code
+
+        # Pointer or reference — this is what we want
+        if code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF):
+            return int(val)
+
+        # Struct — drill into known wrapper fields
+        if code == gdb.TYPE_CODE_STRUCT:
+            # Try well-known inner-pointer field names in priority order
+            for field_name in ('__pointer', 'pointer', 'data', 'inner', 'value'):
+                try:
+                    inner = val[field_name]
+                    result = _extract_raw_ptr(inner, depth + 1)
+                    if result > 0xffff:  # looks like a valid pointer
+                        return result
+                except Exception:
+                    pass
+
+            # Generic single-field struct (common in Rust newtypes)
+            try:
+                fields = ty.fields()
+                if len(fields) == 1:
+                    inner = val[fields[0].name]
+                    result = _extract_raw_ptr(inner, depth + 1)
+                    if result > 0xffff:
+                        return result
+            except Exception:
+                pass
+
+        # Fallback — direct integer conversion
+        result = int(val)
+        return result if result > 0xffff else 0
+    except Exception:
+        return 0
+
 
 def _callee_candidates(addr: int) -> list[str]:
     cands = []
@@ -820,18 +941,9 @@ class ARDGetSnapshotCommand(gdb.Command):
             seq = _CO_POLL_SEQ.get(cid, 0)
             top_async_func = poll_sym
 
-            # 根据函数名判断真实类型：async fn/block → async，其他 → sync
             node_type = "async" if _is_async_symbol(poll_sym) else "sync"
 
-            state_val = "N/A"
-            env_type_name = _pollsym_to_envtype(poll_sym)
-            if env_type_name and this_ptr:
-                try:
-                    env_t = gdb.lookup_type(env_type_name)
-                    env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
-                    state_val = int(env_val["__state"])
-                except Exception:
-                    pass
+            state_val = _read_env_state(poll_sym, this_ptr)
 
             # Try to get source location for this async function
             async_file = ""
@@ -909,33 +1021,48 @@ class ARDGetSnapshotCommand(gdb.Command):
                             for sym in block:
                                 if sym.is_argument:
                                     val = frame.read_var(sym)
-                                    this_ptr = int(val)
+                                    # The first arg is typically Pin<&mut Self>.
+                                    # Pin { __pointer: &mut T } — we need the
+                                    # raw pointer inside.  Try to drill through
+                                    # Pin and reference layers.
+                                    this_ptr = _extract_raw_ptr(val)
                                     break
                         except Exception:
                             pass
                         # Fallback to $rdi if debug info failed
                         if not this_ptr:
                             try:
+                                frame.select()
                                 this_ptr = _reg_u64("rdi")
                             except Exception:
                                 pass
 
                         if this_ptr:
                             try:
-                                cid_phys, _ = _get_or_make_coro_id(fname, this_ptr)
+                                # First try exact match
+                                cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
+
+                                # If we just created a new CID, check if there's
+                                # an existing CID with a nearby address for the
+                                # same function.  Pin wrapping can shift the
+                                # pointer by a small offset, so we merge to
+                                # prevent identity fragmentation.
+                                if is_new:
+                                    nearby = _find_nearby_coro(fname, this_ptr)
+                                    if nearby is not None and nearby != cid_phys:
+                                        # Merge: discard the newly created CID,
+                                        # reuse the nearby one
+                                        key_new = (fname, int(this_ptr))
+                                        _CO_BY_KEY.pop(key_new, None)
+                                        _CO_META.pop(cid_phys, None)
+                                        _CO_POLL_SEQ.pop(cid_phys, None)
+                                        cid_phys = nearby
+
                                 if cid_phys not in shadow_cids:
                                     node_cid = cid_phys
                                     node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
                                     node_addr = hex(this_ptr)
-                                    # Try to read __state from the env
-                                    env_type_name = _pollsym_to_envtype(fname)
-                                    if env_type_name:
-                                        try:
-                                            env_t = gdb.lookup_type(env_type_name)
-                                            env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
-                                            node_state = int(env_val["__state"])
-                                        except Exception:
-                                            pass
+                                    node_state = _read_env_state(fname, this_ptr)
                             except Exception:
                                 pass
 
