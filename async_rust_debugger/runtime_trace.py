@@ -112,6 +112,9 @@ _WHITELIST_PATH = None
 _WHITELIST_ADDR_MAP = {}             # addr -> exact symbol
 _WHITELIST_ADDR_READY = False
 
+# Async symbol set from grouped whitelist (symbols classified as "async")
+_ASYNC_SYMBOL_SET = None   # set[str] | None
+
 _EVENTS_INSTALLED = False
 
 
@@ -456,8 +459,41 @@ def _is_pollish_name(sym_name: str) -> bool:
     return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
 
 def _is_async_symbol(sym_name: str) -> bool:
-    """判断一个符号是否是异步函数（async fn 或 async block 的 poll）"""
-    return ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
+    """
+    Check whether a symbol is an async function.
+    Uses the same criteria as gen_whitelist._classify_symbol:
+    1. Name contains {async_fn# or {async_block# (compiler-generated async)
+    2. Symbol is in the async set from the grouped whitelist (e.g. manual Future::poll impls)
+    """
+    if ("{async_fn#" in sym_name) or ("{async_block#" in sym_name):
+        return True
+    if _ASYNC_SYMBOL_SET is not None and sym_name in _ASYNC_SYMBOL_SET:
+        return True
+    return False
+
+def _load_async_symbol_set_from_grouped():
+    """
+    Load the async symbol set from poll_functions_grouped.json.
+    Called after whitelist generation or when the grouped JSON is first read.
+    """
+    global _ASYNC_SYMBOL_SET
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        return
+    grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+    if not os.path.exists(grouped_path):
+        return
+    try:
+        with open(grouped_path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        async_set = set()
+        for crate_info in data.get("crates", {}).values():
+            for sym in crate_info.get("symbols", []):
+                if sym.get("kind") == "async":
+                    async_set.add(sym["name"])
+        _ASYNC_SYMBOL_SET = async_set
+    except Exception:
+        pass
 
 def _callee_candidates(addr: int) -> list[str]:
     cands = []
@@ -754,6 +790,8 @@ class ARDGenWhitelistCommand(gdb.Command):
             return
         try:
             gen_default_whitelist()
+            # Populate the async symbol set from the newly generated grouped JSON
+            _load_async_symbol_set_from_grouped()
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
@@ -860,13 +898,30 @@ class ARDGetSnapshotCommand(gdb.Command):
                     node_addr = hex(frame.pc())
 
                     if frame_type == "async":
-                        # For async frames, select the frame and read the env ptr
-                        # to assign a CID and read __state
+                        # For async frames, try to read the env ptr from the
+                        # frame's debug info (first argument / self).
+                        # $rdi is unreliable for non-entry frames.
                         node_state = "N/A"
+                        this_ptr = 0
                         try:
                             frame.select()
-                            this_ptr = _reg_u64("rdi")
-                            if this_ptr:
+                            block = frame.block()
+                            for sym in block:
+                                if sym.is_argument:
+                                    val = frame.read_var(sym)
+                                    this_ptr = int(val)
+                                    break
+                        except Exception:
+                            pass
+                        # Fallback to $rdi if debug info failed
+                        if not this_ptr:
+                            try:
+                                this_ptr = _reg_u64("rdi")
+                            except Exception:
+                                pass
+
+                        if this_ptr:
+                            try:
                                 cid_phys, _ = _get_or_make_coro_id(fname, this_ptr)
                                 if cid_phys not in shadow_cids:
                                     node_cid = cid_phys
@@ -874,15 +929,15 @@ class ARDGetSnapshotCommand(gdb.Command):
                                     node_addr = hex(this_ptr)
                                     # Try to read __state from the env
                                     env_type_name = _pollsym_to_envtype(fname)
-                                    if env_type_name and this_ptr:
+                                    if env_type_name:
                                         try:
                                             env_t = gdb.lookup_type(env_type_name)
                                             env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
                                             node_state = int(env_val["__state"])
                                         except Exception:
                                             pass
-                        except Exception:
-                            pass
+                            except Exception:
+                                pass
 
                     phys_tail.append({
                         "type": frame_type,
@@ -946,6 +1001,9 @@ class ARDGetGroupedWhitelistCommand(gdb.Command):
         try:
             with open(grouped_path, "r", encoding="utf-8") as fp:
                 content = fp.read()
+            # Ensure async symbol set is populated when grouped whitelist is read
+            if _ASYNC_SYMBOL_SET is None:
+                _load_async_symbol_set_from_grouped()
             gdb.write(content + "\n")
         except Exception as e:
             gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
