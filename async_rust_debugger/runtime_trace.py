@@ -455,6 +455,10 @@ def _log_ard(message: str, to_console: bool = False):
 def _is_pollish_name(sym_name: str) -> bool:
     return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
 
+def _is_async_symbol(sym_name: str) -> bool:
+    """判断一个符号是否是异步函数（async fn 或 async block 的 poll）"""
+    return ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
+
 def _callee_candidates(addr: int) -> list[str]:
     cands = []
     n1 = _find_pc_function_name(addr)
@@ -771,13 +775,16 @@ class ARDGetSnapshotCommand(gdb.Command):
             "path": []
         }
         
-        # 1. Extract the asynchronous shadow stack (Coroutines)
+        # 1. Extract the shadow stack (traced coroutines and functions)
         top_async_func = ""
         for cid in stack:
             poll_sym, this_ptr = _CO_META.get(cid, ("<unknown>", 0))
             seq = _CO_POLL_SEQ.get(cid, 0)
             top_async_func = poll_sym
-            
+
+            # 根据函数名判断真实类型：async fn/block → async，其他 → sync
+            node_type = "async" if _is_async_symbol(poll_sym) else "sync"
+
             state_val = "N/A"
             env_type_name = _pollsym_to_envtype(poll_sym)
             if env_type_name and this_ptr:
@@ -804,7 +811,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                 pass
 
             snapshot["path"].append({
-                "type": "async",
+                "type": node_type,
                 "cid": cid,
                 "func": poll_sym,
                 "addr": hex(this_ptr),
@@ -815,20 +822,23 @@ class ARDGetSnapshotCommand(gdb.Command):
                 "line": async_line
             })
             
-        # 2. Extract the synchronous tail (Physical frames above the top coroutine)
+        # 2. Extract the physical stack tail (frames above the top traced function)
         sync_tail = []
         try:
             # Start from the currently selected frame (deepest)
             frame = gdb.selected_frame()
             while frame:
                 fname = frame.name()
-                
-                # Stop if we reach the poll entry of the top async function 
+
+                # Stop if we reach the entry of the top traced function
                 # to avoid duplication with the shadow stack
                 if fname == top_async_func:
                     break
-                
+
                 if fname:
+                    # 根据函数名判断真实类型
+                    frame_type = "async" if _is_async_symbol(fname) else "sync"
+
                     # Get source location from the frame
                     sync_file = ""
                     sync_fullname = ""
@@ -843,12 +853,12 @@ class ARDGetSnapshotCommand(gdb.Command):
                         pass
 
                     sync_tail.append({
-                        "type": "sync",
+                        "type": frame_type,
                         "cid": None,
                         "func": fname,
                         "addr": hex(frame.pc()),
                         "poll": 0,
-                        "state": "NON-ASYNC",
+                        "state": "N/A" if frame_type == "async" else "NON-ASYNC",
                         "file": sync_file,
                         "fullname": sync_fullname,
                         "line": sync_line

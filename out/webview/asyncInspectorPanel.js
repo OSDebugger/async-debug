@@ -309,16 +309,16 @@ class AsyncInspectorPanel {
         if (snapshot.path.length === 0) {
             return;
         }
-        // Find the root async node (first async node in path)
+        // Find the root node (first node with CID in the path, regardless of async/sync)
         let rootIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
-            if (snapshot.path[i].type === 'async') {
+            if (snapshot.path[i].cid !== null) {
                 rootIndex = i;
                 break;
             }
         }
         if (rootIndex < 0) {
-            return; // No async nodes, keep existing tree
+            return; // No tracked nodes, keep existing tree
         }
         const rootNode = snapshot.path[rootIndex];
         if (rootNode.cid === null) {
@@ -328,7 +328,7 @@ class AsyncInspectorPanel {
         let root = this._treeRoots.get(rootNode.cid);
         if (!root) {
             root = {
-                type: 'async',
+                type: rootNode.type,
                 cid: rootNode.cid,
                 func: rootNode.func,
                 addr: rootNode.addr,
@@ -339,6 +339,7 @@ class AsyncInspectorPanel {
             this._treeRoots.set(rootNode.cid, root);
         }
         else {
+            root.type = rootNode.type;
             root.poll = rootNode.poll;
             root.state = rootNode.state;
         }
@@ -347,21 +348,19 @@ class AsyncInspectorPanel {
     }
     /**
      * Merge the snapshot path (from startIndex onward) into the tree under `parent`.
-     * - Async nodes are matched by CID and updated or created.
-     * - Sync nodes are deduplicated by func+addr to avoid duplicates on re-snapshot.
-     * - The path represents a single chain (not a fan-out), so each level
-     *   has at most one "current" child being walked.
+     * - Tracked nodes (with CID) are matched by CID and updated or created.
+     * - Untracked sync nodes (no CID, from physical stack) are deduplicated by func+addr.
      */
     mergePathIntoTree(parent, path, startIndex) {
         let current = parent;
         for (let i = startIndex; i < path.length; i++) {
             const node = path[i];
-            if (node.type === 'async' && node.cid !== null) {
-                // Find existing async child by CID
-                let child = current.children.find(c => c.type === 'async' && c.cid === node.cid);
+            if (node.cid !== null) {
+                // Tracked node (has CID) — from shadow stack
+                let child = current.children.find(c => c.cid === node.cid);
                 if (!child) {
                     child = {
-                        type: 'async',
+                        type: node.type,
                         cid: node.cid,
                         func: node.func,
                         addr: node.addr,
@@ -372,16 +371,15 @@ class AsyncInspectorPanel {
                     current.children.push(child);
                 }
                 else {
-                    // Update mutable fields
+                    child.type = node.type;
                     child.poll = node.poll;
                     child.state = node.state;
                 }
-                // Continue deeper into this child
                 current = child;
             }
-            else if (node.type === 'sync') {
-                // Dedup sync nodes by func + addr
-                const existing = current.children.find(c => c.type === 'sync' && c.func === node.func && c.addr === node.addr);
+            else {
+                // Untracked sync node (from physical stack, no CID)
+                const existing = current.children.find(c => c.cid === null && c.func === node.func && c.addr === node.addr);
                 if (!existing) {
                     const syncChild = {
                         type: 'sync',
@@ -393,7 +391,6 @@ class AsyncInspectorPanel {
                         children: [],
                     };
                     current.children.push(syncChild);
-                    // Sync nodes are leaf-like, don't descend into them
                 }
             }
         }
@@ -425,7 +422,7 @@ class AsyncInspectorPanel {
                     </div>
                     <div class="main-content">
                         <div class="tree-panel">
-                            <h3>Async Execution Tree</h3>
+                            <h3>Logical Call Tree</h3>
                             <div id="treeContainer"></div>
                         </div>
                         <div class="side-panel">

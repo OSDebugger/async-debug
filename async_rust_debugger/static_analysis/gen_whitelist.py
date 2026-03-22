@@ -300,11 +300,13 @@ def gen_default_whitelist():
     cwd = os.getcwd()
     out_dir = os.path.join(cwd, temp_dir)
 
-    # 1. Generate grouped JSON (new format)
+    # 1. Generate grouped JSON (new format, contains all functions for UI display)
     grouped_path = os.path.join(out_dir, "poll_functions_grouped.json")
-    grouped_data = gen_grouped_whitelist(grouped_path)
+    gen_grouped_whitelist(grouped_path)
 
-    # 2. Generate flat whitelist filtered to user crates only (default runtime whitelist)
+    # 2. Generate empty flat whitelist (default: no crates enabled, user manually selects)
     flat_path = os.path.join(out_dir, "poll_functions.txt")
-    count = _write_filtered_whitelist(grouped_data, flat_path)
-    gdb.write(f"[ARD] wrote default whitelist (user crates only): {count} symbols -> {flat_path}\n")
+    os.makedirs(os.path.dirname(flat_path), exist_ok=True)
+    with open(flat_path, "w", encoding="utf-8") as fp:
+        fp.write("# Empty default whitelist. Use 'Apply Whitelist' in Async Inspector to enable crates.\n")
+    gdb.write(f"[ARD] wrote empty default whitelist -> {flat_path}\n")

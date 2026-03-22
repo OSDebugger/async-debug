@@ -45,7 +45,7 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No async execution tree available. Start debugging and set a trace point.</div>';
+            container.innerHTML = '<div class="placeholder-text">No call tree available. Start debugging and set a trace point.</div>';
             return;
         }
 
@@ -390,15 +390,8 @@
                 break;
             case 'updateGroupedWhitelist':
                 groupedWhitelist = message.groupedWhitelist;
-                // Initialize enabledCrates with user crates by default
+                // 默认不选中任何 crate，用户按需开启
                 enabledCrates = new Set();
-                if (groupedWhitelist && groupedWhitelist.crates) {
-                    for (const [name, data] of Object.entries(groupedWhitelist.crates)) {
-                        if (data.is_user_crate) {
-                            enabledCrates.add(name);
-                        }
-                    }
-                }
                 renderGroupedWhitelist(groupedWhitelist);
                 break;
         }
