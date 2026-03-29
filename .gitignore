@@ -13,3 +13,5 @@ __pycache__/
 # Hugo build output
 website/public/
 website/.hugo_build.lock
+
+docs/

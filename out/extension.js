@@ -36,14 +36,15 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
 const debugAdapter_1 = require("./debugAdapter");
 const asyncInspectorPanel_1 = require("./webview/asyncInspectorPanel");
-let debugAdapterFactory;
 let inspectorPanel;
+let whitelistWatcher;
 function activate(context) {
     console.log('ARD Debug Adapter extension is now active');
     // Create and register debug adapter factory
-    debugAdapterFactory = new debugAdapter_1.ARDDebugAdapterFactory(context);
+    const debugAdapterFactory = new debugAdapter_1.ARDDebugAdapterFactory(context);
     const disposable = vscode.debug.registerDebugAdapterDescriptorFactory('ardb', debugAdapterFactory);
     context.subscriptions.push(disposable, debugAdapterFactory);
     // Register DebugAdapterTracker EARLY — before any session starts —
@@ -64,12 +65,8 @@ function activate(context) {
     context.subscriptions.push(trackerDisposable);
     // Register command to open async inspector
     const openInspectorCommand = vscode.commands.registerCommand('ardb.openInspector', () => {
-        if (!debugAdapterFactory) {
-            vscode.window.showErrorMessage('Debug adapter factory not initialized');
-            return;
-        }
         if (!inspectorPanel) {
-            inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory);
+            inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri);
         }
         else {
             inspectorPanel.reveal();
@@ -95,7 +92,6 @@ function activate(context) {
             vscode.window.showWarningMessage('No active ARD debug session');
             return;
         }
-        // Send custom request to trace function
         try {
             await debugSession.customRequest('ardb-trace', { symbol });
             vscode.window.showInformationMessage(`Tracing function: ${symbol}`);
@@ -105,32 +101,55 @@ function activate(context) {
         }
     });
     context.subscriptions.push(openInspectorCommand, traceFunctionCommand);
-    // Open inspector automatically when debug session starts
+    // Open inspector automatically when debug session starts + setup whitelist watcher
     const onDidStartDebugSession = vscode.debug.onDidStartDebugSession((session) => {
-        if (session.type === 'ardb' && debugAdapterFactory) {
+        if (session.type === 'ardb') {
             if (!inspectorPanel) {
-                inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri, debugAdapterFactory);
+                inspectorPanel = asyncInspectorPanel_1.AsyncInspectorPanel.createOrShow(context.extensionUri);
+            }
+            // Setup whitelist file watcher
+            const workspaceFolder = session.workspaceFolder?.uri.fsPath;
+            if (workspaceFolder) {
+                const whitelistPath = path.join(workspaceFolder, 'temp', 'poll_functions.txt');
+                whitelistWatcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(path.dirname(whitelistPath), path.basename(whitelistPath)));
+                whitelistWatcher.onDidChange(async () => {
+                    try {
+                        await session.customRequest('ardb-execute-command', {
+                            command: 'ardb-load-whitelist',
+                        });
+                    }
+                    catch (error) {
+                        console.error('Failed to reload whitelist:', error);
+                    }
+                });
             }
         }
     });
     context.subscriptions.push(onDidStartDebugSession);
     // Clean up when debug session ends
     const onDidTerminateDebugSession = vscode.debug.onDidTerminateDebugSession((session) => {
-        if (session.type === 'ardb' && inspectorPanel) {
-            inspectorPanel.dispose();
-            inspectorPanel = undefined;
+        if (session.type === 'ardb') {
+            // Dispose whitelist watcher
+            if (whitelistWatcher) {
+                whitelistWatcher.dispose();
+                whitelistWatcher = undefined;
+            }
+            if (inspectorPanel) {
+                inspectorPanel.dispose();
+                inspectorPanel = undefined;
+            }
         }
     });
     context.subscriptions.push(onDidTerminateDebugSession);
 }
 function deactivate() {
+    if (whitelistWatcher) {
+        whitelistWatcher.dispose();
+        whitelistWatcher = undefined;
+    }
     if (inspectorPanel) {
         inspectorPanel.dispose();
         inspectorPanel = undefined;
-    }
-    if (debugAdapterFactory) {
-        debugAdapterFactory.dispose();
-        debugAdapterFactory = undefined;
     }
 }
 //# sourceMappingURL=extension.js.map

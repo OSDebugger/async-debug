@@ -41,32 +41,16 @@ const gdbDebugSession_1 = require("./gdbDebugSession");
 class ARDDebugAdapterFactory {
     constructor(context) {
         this.context = context;
-        this.gdbSession = new gdbDebugSession_1.GDBDebugSession(context);
     }
     createDebugAdapterDescriptor(session, executable) {
-        const config = session.configuration;
         const workspaceFolder = session.workspaceFolder?.uri.fsPath || process.cwd();
-        const extensionPath = this.context.extensionPath;
-        const pythonPath = extensionPath;
+        const pythonPath = this.context.extensionPath;
         const tempDir = path.join(workspaceFolder, 'temp');
-        const adapterScript = path.join(extensionPath, 'out', 'gdbAdapter.js');
-        return new vscode.DebugAdapterExecutable('node', [adapterScript], {
-            cwd: config.cwd || workspaceFolder,
-            env: {
-                ...process.env,
-                ARDB_PROGRAM: config.program,
-                ARDB_ARGS: JSON.stringify(config.args || []),
-                ARDB_CWD: workspaceFolder,
-                PYTHONPATH: pythonPath,
-                ASYNC_RUST_DEBUGGER_TEMP_DIR: tempDir
-            }
-        });
-    }
-    getActiveSession() {
-        return this.gdbSession;
+        const debugSession = new gdbDebugSession_1.GDBDebugSession({ pythonPath, tempDir });
+        return new vscode.DebugAdapterInlineImplementation(debugSession);
     }
     dispose() {
-        this.gdbSession.dispose();
+        // No resources to clean up — GDBDebugSession lifecycle is managed by VS Code
     }
 }
 exports.ARDDebugAdapterFactory = ARDDebugAdapterFactory;

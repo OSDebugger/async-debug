@@ -39,12 +39,11 @@ const vscode = __importStar(require("vscode"));
  * Async Inspector Panel - Webview for displaying async execution trees
  */
 class AsyncInspectorPanel {
-    constructor(panel, extensionUri, debugAdapterFactory) {
+    constructor(panel, extensionUri) {
         this._disposables = [];
         this._treeRoots = new Map(); // root CID -> tree node
         this._panel = panel;
         this._extensionUri = extensionUri;
-        this._debugAdapterFactory = debugAdapterFactory;
         // Set the webview's initial html content
         this._update();
         // Listen for when the panel is disposed
@@ -83,7 +82,7 @@ class AsyncInspectorPanel {
             this._debugSession = session?.type === 'ardb' ? session : undefined;
         }, null, this._disposables);
     }
-    static createOrShow(extensionUri, debugAdapterFactory) {
+    static createOrShow(extensionUri) {
         const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
@@ -98,7 +97,7 @@ class AsyncInspectorPanel {
             localResourceRoots: [extensionUri],
             retainContextWhenHidden: true
         });
-        AsyncInspectorPanel.currentPanel = new AsyncInspectorPanel(panel, extensionUri, debugAdapterFactory);
+        AsyncInspectorPanel.currentPanel = new AsyncInspectorPanel(panel, extensionUri);
         return AsyncInspectorPanel.currentPanel;
     }
     reveal() {
@@ -121,18 +120,17 @@ class AsyncInspectorPanel {
         }
     }
     async handleReset() {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
-            await session.reset();
+        if (this._debugSession) {
+            await this._debugSession.customRequest('ardb-reset');
             this._treeRoots.clear();
             this._update();
             vscode.window.showInformationMessage('ARD reset completed');
         }
     }
     async handleGenWhitelist() {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
-            const grouped = await session.genWhitelist();
+        if (this._debugSession) {
+            const result = await this._debugSession.customRequest('ardb-gen-whitelist');
+            const grouped = result?.groupedWhitelist;
             if (grouped) {
                 this._panel.webview.postMessage({
                     command: 'updateGroupedWhitelist',
@@ -142,19 +140,18 @@ class AsyncInspectorPanel {
         }
     }
     async handleTrace(symbol) {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
-            await session.traceFunction(symbol);
+        if (this._debugSession) {
+            await this._debugSession.customRequest('ardb-trace', { symbol });
             vscode.window.showInformationMessage(`Tracing: ${symbol}`);
         }
     }
     async handleSnapshot() {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
-            console.warn('[AsyncInspector] handleSnapshot: no GDB session from factory');
+        if (!this._debugSession) {
+            console.warn('[AsyncInspector] handleSnapshot: no debug session');
             return;
         }
-        const snapshot = await session.getSnapshot();
+        const result = await this._debugSession.customRequest('ardb-get-snapshot');
+        const snapshot = result?.snapshot;
         console.log('[AsyncInspector] handleSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
         if (snapshot) {
             this._lastSnapshot = snapshot;
@@ -174,8 +171,6 @@ class AsyncInspectorPanel {
             return;
         }
         // Find the frame index for this CID in the snapshot path.
-        // The snapshot path is ordered root → leaf (async chain).
-        // We map this to the physical GDB stack frame index.
         let targetFrameIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
             const node = snapshot.path[i];
@@ -186,7 +181,6 @@ class AsyncInspectorPanel {
         }
         if (targetFrameIndex >= 0) {
             try {
-                // Get real frame IDs from the stack trace
                 const stackTrace = await this._debugSession.customRequest('stackTrace', {
                     threadId: snapshot.thread_id,
                     startFrame: 0,
@@ -195,13 +189,10 @@ class AsyncInspectorPanel {
                 const frames = stackTrace?.stackFrames || [];
                 if (frames.length > targetFrameIndex) {
                     const frame = frames[targetFrameIndex];
-                    // Use evaluate to switch GDB to this frame, which updates
-                    // the variables view via the debug session
                     await this._debugSession.customRequest('evaluate', {
                         expression: `frame ${targetFrameIndex}`,
                         context: 'repl',
                     });
-                    // Also open the source file at the frame location
                     if (frame.source?.path) {
                         await this.handleSelectFrame(frame.source.path, frame.line || 0);
                     }
@@ -213,18 +204,15 @@ class AsyncInspectorPanel {
         }
     }
     async handleLocate(symbol) {
-        // Use GDB's "info line" command to find the source location of the symbol.
-        // The candidate symbols are fully-qualified GDB names (e.g.
-        // "my_crate::my_module::my_async_fn") that workspace symbol providers
-        // cannot resolve, but GDB can map them to source files directly.
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (!session) {
+        if (!this._debugSession) {
             vscode.window.showWarningMessage('No active debug session');
             return;
         }
         try {
-            const output = await session.executeGDBCommand(`info line '${symbol}'`);
-            // GDB output format: "Line 42 of \"src/main.rs\" starts at address ..."
+            const result = await this._debugSession.customRequest('ardb-execute-command', {
+                command: `info line '${symbol}'`
+            });
+            const output = result?.result || '';
             const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
             if (match) {
                 const line = parseInt(match[1], 10);
@@ -241,10 +229,10 @@ class AsyncInspectorPanel {
         }
     }
     async handleRefreshCandidates() {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
+        if (this._debugSession) {
             // Try grouped whitelist first
-            const grouped = await session.getGroupedWhitelist();
+            const result = await this._debugSession.customRequest('ardb-get-whitelist-grouped');
+            const grouped = result?.groupedWhitelist;
             if (grouped) {
                 this._panel.webview.postMessage({
                     command: 'updateGroupedWhitelist',
@@ -253,7 +241,8 @@ class AsyncInspectorPanel {
             }
             else {
                 // Fallback to flat candidate list
-                const candidates = await session.getWhitelistCandidates();
+                const candResult = await this._debugSession.customRequest('ardb-get-whitelist-candidates');
+                const candidates = candResult?.candidates || [];
                 this._panel.webview.postMessage({
                     command: 'updateCandidates',
                     candidates: candidates
@@ -262,9 +251,8 @@ class AsyncInspectorPanel {
         }
     }
     async handleUpdateWhitelistCrates(enabledCrates) {
-        const session = this._debugAdapterFactory?.getActiveSession();
-        if (session) {
-            await session.updateWhitelistSelection(enabledCrates);
+        if (this._debugSession) {
+            await this._debugSession.customRequest('ardb-update-whitelist', { enabledCrates });
             vscode.window.showInformationMessage(`Whitelist updated: ${enabledCrates.length} crate(s) enabled`);
         }
     }
@@ -277,8 +265,6 @@ class AsyncInspectorPanel {
             return;
         }
         try {
-            // GDB may return relative paths (e.g. "src/main.rs").
-            // Resolve them against the workspace folder to get an absolute path.
             let uri;
             if (file.startsWith('/')) {
                 uri = vscode.Uri.file(file);
@@ -293,7 +279,7 @@ class AsyncInspectorPanel {
                 }
             }
             const doc = await vscode.workspace.openTextDocument(uri);
-            const targetLine = Math.max(0, line - 1); // VS Code lines are 0-based
+            const targetLine = Math.max(0, line - 1);
             await vscode.window.showTextDocument(doc, {
                 selection: new vscode.Range(targetLine, 0, targetLine, 0),
                 preserveFocus: false,
@@ -309,7 +295,6 @@ class AsyncInspectorPanel {
         if (snapshot.path.length === 0) {
             return;
         }
-        // Find the root node (first node with CID in the path, regardless of async/sync)
         let rootIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
             if (snapshot.path[i].cid !== null) {
@@ -318,13 +303,12 @@ class AsyncInspectorPanel {
             }
         }
         if (rootIndex < 0) {
-            return; // No tracked nodes, keep existing tree
+            return;
         }
         const rootNode = snapshot.path[rootIndex];
         if (rootNode.cid === null) {
             return;
         }
-        // Get or create root tree node
         let root = this._treeRoots.get(rootNode.cid);
         if (!root) {
             root = {
@@ -343,20 +327,13 @@ class AsyncInspectorPanel {
             root.poll = rootNode.poll;
             root.state = rootNode.state;
         }
-        // Build the child chain from the snapshot path
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
     }
-    /**
-     * Merge the snapshot path (from startIndex onward) into the tree under `parent`.
-     * - Tracked nodes (with CID) are matched by CID and updated or created.
-     * - Untracked sync nodes (no CID, from physical stack) are deduplicated by func+addr.
-     */
     mergePathIntoTree(parent, path, startIndex) {
         let current = parent;
         for (let i = startIndex; i < path.length; i++) {
             const node = path[i];
             if (node.cid !== null) {
-                // Tracked node (has CID) — from shadow stack
                 let child = current.children.find(c => c.cid === node.cid);
                 if (!child) {
                     child = {
@@ -378,8 +355,6 @@ class AsyncInspectorPanel {
                 current = child;
             }
             else {
-                // Untracked node (from physical stack, no CID)
-                // Preserve the real type (async/sync) from the snapshot
                 const existing = current.children.find(c => c.cid === null && c.func === node.func && c.addr === node.addr);
                 if (!existing) {
                     const untrackedChild = {
@@ -401,7 +376,6 @@ class AsyncInspectorPanel {
         this._panel.webview.html = this._getHtmlForWebview(webview);
     }
     _getHtmlForWebview(webview) {
-        // Get paths to webview resources
         const scriptPath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'asyncInspector.js');
         const stylePath = vscode.Uri.joinPath(this._extensionUri, 'src', 'webview', 'asyncInspector.css');
         const scriptUri = webview.asWebviewUri(scriptPath);
