@@ -1,16 +1,16 @@
 
-````md
-# runtime_trace.py 调试操作清单
+## runtime_trace.py 调试操作清单
 
 ## 📌 说明
+
 本指南用于在 VS Code + GDB 环境下调试 `runtime_trace.py`。
 以启动embassy/examples/std/src/bin/tick.rs为例
 
----
 
 ## 🧩 VS Code
 
 ### 1. 打开项目
+
 打开项目目录：
 
 ```bash
@@ -19,7 +19,7 @@
 
 ---
 
-### 2. 确认 `runtime_trace.py` 已添加 debugpy 钩子
+### 2. 确认 runtime_trace.py 已添加 debugpy 钩子
 
 ```python
 import os
