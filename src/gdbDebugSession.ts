@@ -326,7 +326,7 @@ export class GDBDebugSession extends DebugSession {
 
             if (!this.inferiorStarted) {
                 this.inferiorStarted = true;
-                await this.miDebugger!.sendCommand('-exec-run');
+                await this.miDebugger!.sendCommand('exec-run');
             } else {
                 await this.miDebugger!.continue();
             }
@@ -456,7 +456,7 @@ export class GDBDebugSession extends DebugSession {
         }
 
         try {
-            await this.miDebugger!.sendCommand(`-thread-select ${threadId}`);
+            await this.miDebugger!.sendCommand(`thread-select ${threadId}`);
 
             const record = await this.miDebugger!.sendCliCommand('ardb-get-snapshot');
             const output = this.getConsoleOutput(record);
@@ -1028,8 +1028,8 @@ export class GDBDebugSession extends DebugSession {
         frameLevel: number,
         scopeKind: 'args' | 'locals',
     ): Promise<void> {
-        await this.miDebugger!.sendCommand(`-thread-select ${threadId}`);
-        await this.miDebugger!.sendCommand(`-stack-select-frame ${frameLevel}`);
+        await this.miDebugger!.sendCommand(`thread-select ${threadId}`);
+        await this.miDebugger!.sendCommand(`stack-select-frame ${frameLevel}`);
 
         let miVars: any[] | undefined;
 
