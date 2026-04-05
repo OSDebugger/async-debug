@@ -18,7 +18,6 @@ import {
 import { DebugProtocol } from '@vscode/debugprotocol';
 import { MI2, escape } from './backend/mi2';
 import { MINode } from './backend/mi_parse';
-import { VariableObject } from './backend/backend';
 import {
     BreakpointGroups,
     Border,
@@ -131,6 +130,8 @@ export class GDBDebugSession extends DebugSession {
 
     // Inferior state
     private inferiorStarted = false;
+    private gdbReady = false;       // GDB process has connected and is ready to accept commands
+    private isAttachMode = false;   // true when using attach (QEMU) mode
     private program = '';
     private programArgs: string[] = [];
     private cwd = '';
@@ -211,6 +212,8 @@ export class GDBDebugSession extends DebugSession {
 
         this.launchGDB();
         this.inferiorStarted = false;
+        this.gdbReady = false;
+        this.isAttachMode = false;
         this.sendResponse(response);
     }
 
@@ -279,16 +282,28 @@ export class GDBDebugSession extends DebugSession {
             }
         }
 
-        // Launch QEMU in the integrated terminal
+        // Launch QEMU in the integrated terminal, then start GDB after a short delay
+        // to give QEMU time to open the GDB stub on :1234.
         const qemuCmd = [config.qemuPath, ...config.qemuArgs];
         this.runInTerminalRequest(
             { kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd },
-            10,
-            (_response) => { /* QEMU launched, proceed */ }
+            15000,
+            (termResponse) => {
+                if (termResponse.success === false) {
+                    console.error('[ardb] Failed to launch QEMU in terminal');
+                    this.sendEvent(new TerminatedEvent());
+                    return;
+                }
+                // Give QEMU ~1s to open the GDB stub before GDB tries to connect
+                setTimeout(() => {
+                    this.launchGDB(config);
+                }, 1000);
+            }
         );
 
-        this.launchGDB(config);
         this.inferiorStarted = false;
+        this.gdbReady = false;
+        this.isAttachMode = true;
         this.sendResponse(response);
     }
 
@@ -302,10 +317,15 @@ export class GDBDebugSession extends DebugSession {
     ): void {
         this.sendResponse(response);
 
-        const event = new StoppedEvent('entry', 1);
-        (event.body as any).description = 'Program loaded. Configure ARD, then press Continue to run.';
-        (event.body as any).allThreadsStopped = true;
-        this.sendEvent(event);
+        // In attach mode, GDB hasn't connected yet — the real stop will come from GDB
+        // after connecting to QEMU (via stopAtConnect). Don't send a fake StoppedEvent.
+        // In launch mode, send an entry stop so the UI shows "paused" while the user configures.
+        if (!this.isAttachMode) {
+            const event = new StoppedEvent('entry', 1);
+            (event.body as any).description = 'Program loaded. Configure ARD, then press Continue to run.';
+            (event.body as any).allThreadsStopped = true;
+            this.sendEvent(event);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -453,11 +473,15 @@ export class GDBDebugSession extends DebugSession {
         response: DebugProtocol.ContinueResponse,
         args: DebugProtocol.ContinueArguments,
     ): Promise<void> {
-        if (!this.miDebugger) { this.sendErrorResponse(response, 4, 'No debug session'); return; }
+        if (!this.miDebugger || !this.gdbReady) {
+            this.sendErrorResponse(response, 4, 'GDB is not ready yet. Please wait for the debugger to connect.');
+            return;
+        }
         try {
             await this.cleanupVariables();
 
-            if (!this.inferiorStarted) {
+            if (!this.inferiorStarted && !this.isAttachMode) {
+                // Launch mode: first Continue starts the program
                 this.inferiorStarted = true;
                 await this.miDebugger!.sendCommand('exec-run');
             } else {
@@ -895,7 +919,8 @@ export class GDBDebugSession extends DebugSession {
     // -----------------------------------------------------------------------
 
     private async handleArdGetSnapshot(response: DebugProtocol.Response): Promise<void> {
-        const record = await this.miDebugger!.sendCliCommand('ardb-get-snapshot');
+        if (!this.miDebugger) { response.body = { snapshot: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommand('ardb-get-snapshot');
         const output = this.getConsoleOutput(record);
         const snapshot = this.parseSnapshot(output);
         response.body = { snapshot: snapshot || null };
@@ -903,7 +928,8 @@ export class GDBDebugSession extends DebugSession {
     }
 
     private async handleArdReset(response: DebugProtocol.Response): Promise<void> {
-        await this.miDebugger!.sendCliCommand('ardb-reset');
+        if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
+        await this.miDebugger.sendCliCommand('ardb-reset');
         if (fs.existsSync(this.logPath)) {
             fs.writeFileSync(this.logPath, '');
         }
@@ -912,15 +938,17 @@ export class GDBDebugSession extends DebugSession {
     }
 
     private async handleArdGenWhitelist(response: DebugProtocol.Response): Promise<void> {
-        await this.miDebugger!.sendCliCommand('ardb-gen-whitelist');
+        if (!this.miDebugger) { response.body = { groupedWhitelist: null }; this.sendResponse(response); return; }
+        await this.miDebugger.sendCliCommand('ardb-gen-whitelist');
         const grouped = this.readGroupedWhitelistFromDisk();
         response.body = { groupedWhitelist: grouped || null };
         this.sendResponse(response);
     }
 
     private async handleArdTrace(response: DebugProtocol.Response, args: any): Promise<void> {
+        if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         const symbol = args?.symbol || '';
-        await this.miDebugger!.sendCliCommand(`ardb-trace ${symbol}`);
+        await this.miDebugger.sendCliCommand(`ardb-trace ${symbol}`);
         response.body = {};
         this.sendResponse(response);
     }
@@ -932,7 +960,8 @@ export class GDBDebugSession extends DebugSession {
             this.sendResponse(response);
             return;
         }
-        const record = await this.miDebugger!.sendCliCommand('ardb-get-whitelist-grouped');
+        if (!this.miDebugger) { response.body = { groupedWhitelist: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommand('ardb-get-whitelist-grouped');
         const output = this.getConsoleOutput(record);
         const parsed = this.parseJsonFromOutput(output) as GroupedWhitelist | undefined;
         response.body = { groupedWhitelist: parsed || null };
@@ -946,15 +975,17 @@ export class GDBDebugSession extends DebugSession {
     }
 
     private async handleArdUpdateWhitelist(response: DebugProtocol.Response, args: any): Promise<void> {
+        if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         const enabledCrates = args?.enabledCrates || [];
         const payload = JSON.stringify({ enabled_crates: enabledCrates });
-        await this.miDebugger!.sendCliCommand(`ardb-update-whitelist ${payload}`);
+        await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
         response.body = {};
         this.sendResponse(response);
     }
 
     private async handleArdInferTraceRoot(response: DebugProtocol.Response): Promise<void> {
-        const record = await this.miDebugger!.sendCliCommand('ardb-infer-trace-root');
+        if (!this.miDebugger) { response.body = { inferredTraceRoot: null }; this.sendResponse(response); return; }
+        const record = await this.miDebugger.sendCliCommand('ardb-infer-trace-root');
         const output = this.getConsoleOutput(record);
         const result = this.parseJsonFromOutput(output) as InferredTraceRoot | undefined;
         response.body = { inferredTraceRoot: result || null };
@@ -981,8 +1012,9 @@ export class GDBDebugSession extends DebugSession {
     }
 
     private async handleArdExecuteCommand(response: DebugProtocol.Response, args: any): Promise<void> {
+        if (!this.miDebugger) { response.body = { result: '' }; this.sendResponse(response); return; }
         const command = args?.command || '';
-        const record = await this.miDebugger!.sendCliCommand(command);
+        const record = await this.miDebugger.sendCliCommand(command);
         const result = this.getConsoleOutput(record);
         response.body = { result };
         this.sendResponse(response);
@@ -1023,6 +1055,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('debug-ready', () => {
+            this.gdbReady = true;
             if (attachConfig) {
                 // Attach mode: GDB connected to remote — OS debug is now active
                 this.osDebugReady = true;
@@ -1034,9 +1067,12 @@ export class GDBDebugSession extends DebugSession {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
+                // In OS debug mode, the state machine decides whether to stop or continue.
+                // Don't send StoppedEvent here — osStateTransition may call continue() instead.
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                this.handleBreakpointHit(node);
             }
-            this.handleBreakpointHit(node);
         });
 
         this.miDebugger!.on('step-end', (node: MINode) => {
@@ -1044,10 +1080,11 @@ export class GDBDebugSession extends DebugSession {
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                const event = new StoppedEvent('step', threadId);
+                (event.body as any).allThreadsStopped = true;
+                this.sendEvent(event);
             }
-            const event = new StoppedEvent('step', threadId);
-            (event.body as any).allThreadsStopped = true;
-            this.sendEvent(event);
         });
 
         this.miDebugger!.on('step-other', (node: MINode) => {
@@ -1055,19 +1092,25 @@ export class GDBDebugSession extends DebugSession {
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                const event = new StoppedEvent('pause', threadId);
+                (event.body as any).allThreadsStopped = true;
+                this.sendEvent(event);
             }
-            const event = new StoppedEvent('pause', threadId);
-            (event.body as any).allThreadsStopped = true;
-            this.sendEvent(event);
         });
 
         this.miDebugger!.on('signal-stop', (node: MINode) => {
             const threadId = this.getThreadId(node);
-            const sigName = node.record('signal-name') || 'unknown';
-            const event = new StoppedEvent('exception', threadId);
-            (event.body as any).description = `Signal: ${sigName}`;
-            (event.body as any).allThreadsStopped = true;
-            this.sendEvent(event);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                const sigName = node.record('signal-name') || 'unknown';
+                const event = new StoppedEvent('exception', threadId);
+                (event.body as any).description = `Signal: ${sigName}`;
+                (event.body as any).allThreadsStopped = true;
+                this.sendEvent(event);
+            }
         });
 
         this.miDebugger!.on('stopped', (node: MINode) => {
@@ -1075,10 +1118,11 @@ export class GDBDebugSession extends DebugSession {
             this.recentStopThreadId = threadId;
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                const event = new StoppedEvent('pause', threadId);
+                (event.body as any).allThreadsStopped = true;
+                this.sendEvent(event);
             }
-            const event = new StoppedEvent('pause', threadId);
-            (event.body as any).allThreadsStopped = true;
-            this.sendEvent(event);
         });
 
         this.miDebugger!.on('running', (node: MINode) => {
@@ -1131,8 +1175,24 @@ export class GDBDebugSession extends DebugSession {
     private osStateTransition(event: OSEvent): void {
         const [nextState, actions] = stateTransition(OSStateMachine, this.osState, event);
         this.osState = nextState;
+
+        // Actions that cause automatic continuation — don't send StoppedEvent in these cases
+        const autorunActions = new Set([
+            DebuggerActions.start_consecutive_single_steps,
+            DebuggerActions.low_level_switch_breakpoint_group_to_high_level,
+            DebuggerActions.high_level_switch_breakpoint_group_to_low_level,
+        ]);
+        const willAutorun = actions.some(a => autorunActions.has(a.type));
+
         for (const action of actions) {
             this.doAction(action);
+        }
+
+        // If the state machine doesn't intend to auto-continue, surface the stop to the UI
+        if (!willAutorun) {
+            const event2 = new StoppedEvent('breakpoint', this.recentStopThreadId);
+            (event2.body as any).allThreadsStopped = true;
+            this.sendEvent(event2);
         }
     }
 

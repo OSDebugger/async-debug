@@ -39,6 +39,9 @@ const path = __importStar(require("path"));
 const debugadapter_1 = require("@vscode/debugadapter");
 const mi2_1 = require("./backend/mi2");
 const mi_parse_1 = require("./backend/mi_parse");
+const breakpointGroups_1 = require("./breakpointGroups");
+const OSStateMachine_1 = require("./OSStateMachine");
+const addrSpace_1 = require("./addrSpace");
 // ---------------------------------------------------------------------------
 // GDBDebugSession
 // ---------------------------------------------------------------------------
@@ -47,6 +50,8 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         super();
         // Inferior state
         this.inferiorStarted = false;
+        this.gdbReady = false; // GDB process has connected and is ready to accept commands
+        this.isAttachMode = false; // true when using attach (QEMU) mode
         this.program = '';
         this.programArgs = [];
         this.cwd = '';
@@ -59,6 +64,13 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.nextVarRef = 1;
         this.varRefMap = new Map();
         this.createdVarObjects = [];
+        // OS debug state
+        this.osDebugReady = false;
+        this.osState = new OSStateMachine_1.OSState(OSStateMachine_1.OSStateMachine.initial);
+        this.recentStopThreadId = 1;
+        this.kernelMemoryRanges = [];
+        this.userMemoryRanges = [];
+        this.programCounterId = 32; // RISC-V PC register id
         this.pythonPath = opts.pythonPath;
         this.tempDir = opts.tempDir;
         this.logPath = path.join(opts.tempDir, 'ardb.log');
@@ -94,6 +106,79 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         }
         this.launchGDB();
         this.inferiorStarted = false;
+        this.gdbReady = false;
+        this.isAttachMode = false;
+        this.sendResponse(response);
+    }
+    // -----------------------------------------------------------------------
+    // DAP: attach
+    // -----------------------------------------------------------------------
+    attachRequest(response, args) {
+        const config = args;
+        this.cwd = config.cwd || process.cwd();
+        if (!config.qemuPath || !config.qemuArgs?.length) {
+            this.sendErrorResponse(response, 103, '`qemuPath` and `qemuArgs` must be set in launch.json');
+            return;
+        }
+        if (!fs.existsSync(this.tempDir)) {
+            fs.mkdirSync(this.tempDir, { recursive: true });
+        }
+        // Initialize OS debug state from launch.json config
+        this.programCounterId = config.program_counter_id ?? 32;
+        this.kernelMemoryRanges = config.kernel_memory_ranges ?? [];
+        this.userMemoryRanges = config.user_memory_ranges ?? [];
+        this.osState = new OSStateMachine_1.OSState(OSStateMachine_1.OSStateMachine.initial);
+        this.osDebugReady = false;
+        // Build IBreakpointGroupsSession adapter
+        const firstGroup = config.first_breakpoint_group ?? 'kernel';
+        const secondGroup = config.second_breakpoint_group ?? 'user';
+        const filePathToGroupNames = config.filePathToBreakpointGroupNames
+            ? (0, breakpointGroups_1.toFunctionString)({ body: config.filePathToBreakpointGroupNames.functionBody, args: [config.filePathToBreakpointGroupNames.functionArguments] })
+            : '(function(filepath) { return ["kernel"]; })';
+        const groupNameToFilePaths = config.breakpointGroupNameToDebugFilePaths
+            ? (0, breakpointGroups_1.toFunctionString)({ body: config.breakpointGroupNameToDebugFilePaths.functionBody, args: [config.breakpointGroupNameToDebugFilePaths.functionArguments] })
+            : '(function(groupName) { return []; })';
+        const self = this;
+        const bpgSession = {
+            get miDebugger() {
+                return self.miDebugger;
+            },
+            filePathToBreakpointGroupNames: filePathToGroupNames,
+            breakpointGroupNameToDebugFilePaths: groupNameToFilePaths,
+            showInformationMessage(msg) {
+                self.sendEvent({ event: 'showInformationMessage', type: 'event', body: msg, seq: 0 });
+            },
+        };
+        this.breakpointGroups = new breakpointGroups_1.BreakpointGroups(firstGroup, bpgSession, secondGroup);
+        // Register initial borders from launch.json
+        if (config.border_breakpoints) {
+            for (const b of config.border_breakpoints) {
+                this.breakpointGroups.updateBorder(new breakpointGroups_1.Border(b.filepath, b.line));
+            }
+        }
+        // Register initial hook breakpoints from launch.json
+        if (config.hook_breakpoints) {
+            for (const h of config.hook_breakpoints) {
+                this.breakpointGroups.updateHookBreakpoint(h);
+            }
+        }
+        // Launch QEMU in the integrated terminal, then start GDB after a short delay
+        // to give QEMU time to open the GDB stub on :1234.
+        const qemuCmd = [config.qemuPath, ...config.qemuArgs];
+        this.runInTerminalRequest({ kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd }, 15000, (termResponse) => {
+            if (termResponse.success === false) {
+                console.error('[ardb] Failed to launch QEMU in terminal');
+                this.sendEvent(new debugadapter_1.TerminatedEvent());
+                return;
+            }
+            // Give QEMU ~1s to open the GDB stub before GDB tries to connect
+            setTimeout(() => {
+                this.launchGDB(config);
+            }, 1000);
+        });
+        this.inferiorStarted = false;
+        this.gdbReady = false;
+        this.isAttachMode = true;
         this.sendResponse(response);
     }
     // -----------------------------------------------------------------------
@@ -101,10 +186,15 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // -----------------------------------------------------------------------
     configurationDoneRequest(response, args) {
         this.sendResponse(response);
-        const event = new debugadapter_1.StoppedEvent('entry', 1);
-        event.body.description = 'Program loaded. Configure ARD, then press Continue to run.';
-        event.body.allThreadsStopped = true;
-        this.sendEvent(event);
+        // In attach mode, GDB hasn't connected yet — the real stop will come from GDB
+        // after connecting to QEMU (via stopAtConnect). Don't send a fake StoppedEvent.
+        // In launch mode, send an entry stop so the UI shows "paused" while the user configures.
+        if (!this.isAttachMode) {
+            const event = new debugadapter_1.StoppedEvent('entry', 1);
+            event.body.description = 'Program loaded. Configure ARD, then press Continue to run.';
+            event.body.allThreadsStopped = true;
+            this.sendEvent(event);
+        }
     }
     // -----------------------------------------------------------------------
     // DAP: setBreakpoints
@@ -226,13 +316,14 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // DAP: continue
     // -----------------------------------------------------------------------
     async continueRequest(response, args) {
-        if (!this.miDebugger) {
-            this.sendErrorResponse(response, 4, 'No debug session');
+        if (!this.miDebugger || !this.gdbReady) {
+            this.sendErrorResponse(response, 4, 'GDB is not ready yet. Please wait for the debugger to connect.');
             return;
         }
         try {
             await this.cleanupVariables();
-            if (!this.inferiorStarted) {
+            if (!this.inferiorStarted && !this.isAttachMode) {
+                // Launch mode: first Continue starts the program
                 this.inferiorStarted = true;
                 await this.miDebugger.sendCommand('exec-run');
             }
@@ -542,6 +633,50 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                     this.sendErrorResponse(response, 109, err.message);
                 });
                 break;
+            // OS debug commands
+            case 'setBorder':
+                if (this.breakpointGroups && args) {
+                    this.breakpointGroups.updateBorder(new breakpointGroups_1.Border(args.filepath, args.line));
+                }
+                this.sendResponse(response);
+                break;
+            case 'disableBorder':
+                if (this.breakpointGroups && args) {
+                    this.breakpointGroups.disableBorder(new breakpointGroups_1.Border(args.filepath, args.line));
+                }
+                this.sendResponse(response);
+                break;
+            case 'setHookBreakpoint':
+                if (this.breakpointGroups && args) {
+                    this.breakpointGroups.updateHookBreakpoint(args);
+                }
+                this.sendResponse(response);
+                break;
+            case 'disableHookBreakpoint':
+                if (this.breakpointGroups && args) {
+                    this.breakpointGroups.disableHookBreakpoint(args);
+                }
+                this.sendResponse(response);
+                break;
+            case 'removeAllCliBreakpoints':
+                if (this.breakpointGroups) {
+                    this.breakpointGroups.disableCurrentBreakpointGroupBreakpoints();
+                    this.breakpointGroups.removeAllBreakpoints();
+                }
+                if (this.miDebugger) {
+                    this.miDebugger.sendCommand('break-delete').catch(() => { });
+                }
+                this.fileBreakpoints.clear();
+                this.gdbBkptToDap.clear();
+                this.functionBreakpointNumbers = [];
+                this.sendResponse(response);
+                break;
+            case 'disableCurrentBreakpointGroupBreakpoints':
+                if (this.breakpointGroups) {
+                    this.breakpointGroups.disableCurrentBreakpointGroupBreakpoints();
+                }
+                this.sendResponse(response);
+                break;
             default:
                 super.customRequest(command, response, args);
                 break;
@@ -551,6 +686,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // Custom request handlers
     // -----------------------------------------------------------------------
     async handleArdGetSnapshot(response) {
+        if (!this.miDebugger) {
+            response.body = { snapshot: null };
+            this.sendResponse(response);
+            return;
+        }
         const record = await this.miDebugger.sendCliCommand('ardb-get-snapshot');
         const output = this.getConsoleOutput(record);
         const snapshot = this.parseSnapshot(output);
@@ -558,6 +698,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdReset(response) {
+        if (!this.miDebugger) {
+            response.body = {};
+            this.sendResponse(response);
+            return;
+        }
         await this.miDebugger.sendCliCommand('ardb-reset');
         if (fs.existsSync(this.logPath)) {
             fs.writeFileSync(this.logPath, '');
@@ -566,12 +711,22 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdGenWhitelist(response) {
+        if (!this.miDebugger) {
+            response.body = { groupedWhitelist: null };
+            this.sendResponse(response);
+            return;
+        }
         await this.miDebugger.sendCliCommand('ardb-gen-whitelist');
         const grouped = this.readGroupedWhitelistFromDisk();
         response.body = { groupedWhitelist: grouped || null };
         this.sendResponse(response);
     }
     async handleArdTrace(response, args) {
+        if (!this.miDebugger) {
+            response.body = {};
+            this.sendResponse(response);
+            return;
+        }
         const symbol = args?.symbol || '';
         await this.miDebugger.sendCliCommand(`ardb-trace ${symbol}`);
         response.body = {};
@@ -581,6 +736,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         const grouped = this.readGroupedWhitelistFromDisk();
         if (grouped) {
             response.body = { groupedWhitelist: grouped };
+            this.sendResponse(response);
+            return;
+        }
+        if (!this.miDebugger) {
+            response.body = { groupedWhitelist: null };
             this.sendResponse(response);
             return;
         }
@@ -596,6 +756,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdUpdateWhitelist(response, args) {
+        if (!this.miDebugger) {
+            response.body = {};
+            this.sendResponse(response);
+            return;
+        }
         const enabledCrates = args?.enabledCrates || [];
         const payload = JSON.stringify({ enabled_crates: enabledCrates });
         await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
@@ -603,6 +768,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdInferTraceRoot(response) {
+        if (!this.miDebugger) {
+            response.body = { inferredTraceRoot: null };
+            this.sendResponse(response);
+            return;
+        }
         const record = await this.miDebugger.sendCliCommand('ardb-infer-trace-root');
         const output = this.getConsoleOutput(record);
         const result = this.parseJsonFromOutput(output);
@@ -627,6 +797,11 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
         this.sendResponse(response);
     }
     async handleArdExecuteCommand(response, args) {
+        if (!this.miDebugger) {
+            response.body = { result: '' };
+            this.sendResponse(response);
+            return;
+        }
         const command = args?.command || '';
         const record = await this.miDebugger.sendCliCommand(command);
         const result = this.getConsoleOutput(record);
@@ -636,19 +811,15 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
     // -----------------------------------------------------------------------
     // GDB subprocess management (via MI2)
     // -----------------------------------------------------------------------
-    launchGDB() {
+    launchGDB(attachConfig) {
+        const gdbPath = attachConfig?.gdbpath || 'gdb';
         const gdbArgs = [
             '--interpreter=mi2',
             '-ex', `python import sys; sys.path.insert(0, '${this.pythonPath}'); import async_rust_debugger`,
             '-ex', 'set pagination off',
         ];
-        const args = this.programArgs;
         const env = { ...process.env, ASYNC_RUST_DEBUGGER_TEMP_DIR: this.tempDir };
-        // Construct full args: interpreter flags + program
-        const fullArgs = gdbArgs.concat([this.program]);
-        if (args.length > 0)
-            fullArgs.push('--args', ...args);
-        this.miDebugger = new mi2_1.MI2('gdb', fullArgs, [], env);
+        this.miDebugger = new mi2_1.MI2(gdbPath, gdbArgs, attachConfig?.debugger_args || [], env);
         // Wire up events
         this.miDebugger.on('msg', (type, msg) => {
             if (type === 'console' || type === 'stdout') {
@@ -665,34 +836,75 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
             console.error('[Adapter] GDB launch error:', err);
             this.sendEvent(new debugadapter_1.TerminatedEvent());
         });
+        this.miDebugger.on('debug-ready', () => {
+            this.gdbReady = true;
+            if (attachConfig) {
+                // Attach mode: GDB connected to remote — OS debug is now active
+                this.osDebugReady = true;
+                this.inferiorStarted = true;
+            }
+        });
         this.miDebugger.on('breakpoint', (node) => {
-            this.handleBreakpointHit(node);
+            const threadId = this.getThreadId(node);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                // In OS debug mode, the state machine decides whether to stop or continue.
+                // Don't send StoppedEvent here — osStateTransition may call continue() instead.
+                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+            }
+            else {
+                this.handleBreakpointHit(node);
+            }
         });
         this.miDebugger.on('step-end', (node) => {
             const threadId = this.getThreadId(node);
-            const event = new debugadapter_1.StoppedEvent('step', threadId);
-            event.body.allThreadsStopped = true;
-            this.sendEvent(event);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+            }
+            else {
+                const event = new debugadapter_1.StoppedEvent('step', threadId);
+                event.body.allThreadsStopped = true;
+                this.sendEvent(event);
+            }
         });
         this.miDebugger.on('step-other', (node) => {
             const threadId = this.getThreadId(node);
-            const event = new debugadapter_1.StoppedEvent('pause', threadId);
-            event.body.allThreadsStopped = true;
-            this.sendEvent(event);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+            }
+            else {
+                const event = new debugadapter_1.StoppedEvent('pause', threadId);
+                event.body.allThreadsStopped = true;
+                this.sendEvent(event);
+            }
         });
         this.miDebugger.on('signal-stop', (node) => {
             const threadId = this.getThreadId(node);
-            const sigName = node.record('signal-name') || 'unknown';
-            const event = new debugadapter_1.StoppedEvent('exception', threadId);
-            event.body.description = `Signal: ${sigName}`;
-            event.body.allThreadsStopped = true;
-            this.sendEvent(event);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+            }
+            else {
+                const sigName = node.record('signal-name') || 'unknown';
+                const event = new debugadapter_1.StoppedEvent('exception', threadId);
+                event.body.description = `Signal: ${sigName}`;
+                event.body.allThreadsStopped = true;
+                this.sendEvent(event);
+            }
         });
         this.miDebugger.on('stopped', (node) => {
             const threadId = this.getThreadId(node);
-            const event = new debugadapter_1.StoppedEvent('pause', threadId);
-            event.body.allThreadsStopped = true;
-            this.sendEvent(event);
+            this.recentStopThreadId = threadId;
+            if (this.osDebugReady) {
+                this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.STOPPED));
+            }
+            else {
+                const event = new debugadapter_1.StoppedEvent('pause', threadId);
+                event.body.allThreadsStopped = true;
+                this.sendEvent(event);
+            }
         });
         this.miDebugger.on('running', (node) => {
             const threadId = this.getThreadId(node);
@@ -711,11 +923,218 @@ class GDBDebugSession extends debugadapter_1.DebugSession {
                 }
             }
         });
-        // Start GDB process via load() — but we only want to spawn, not run
-        // MI2.load() calls initCommands + emits 'debug-ready'. We use sendCommand directly after.
-        this.miDebugger.load(this.cwd, this.program, this.programArgs.join(' ')).catch(err => {
-            console.error('[Adapter] MI2 load error:', err);
-        });
+        // Start GDB: attach mode connects to remote gdbserver, launch mode loads the program
+        if (attachConfig) {
+            this.miDebugger.connect(this.cwd, attachConfig.executable || '', attachConfig.target, attachConfig.autorun || []).catch(err => {
+                console.error('[Adapter] MI2 connect error:', err);
+            });
+        }
+        else {
+            const fullProgram = this.program;
+            const procArgsStr = this.programArgs.join(' ');
+            this.miDebugger.load(this.cwd, fullProgram, procArgsStr).catch(err => {
+                console.error('[Adapter] MI2 load error:', err);
+            });
+        }
+    }
+    // -----------------------------------------------------------------------
+    // OS debug: state machine + doAction
+    // -----------------------------------------------------------------------
+    /**
+     * Feed an OS event into the state machine and execute all resulting actions.
+     * Called from stop event handlers when osDebugReady is true.
+     */
+    osStateTransition(event) {
+        const [nextState, actions] = (0, OSStateMachine_1.stateTransition)(OSStateMachine_1.OSStateMachine, this.osState, event);
+        this.osState = nextState;
+        // Actions that cause automatic continuation — don't send StoppedEvent in these cases
+        const autorunActions = new Set([
+            OSStateMachine_1.DebuggerActions.start_consecutive_single_steps,
+            OSStateMachine_1.DebuggerActions.low_level_switch_breakpoint_group_to_high_level,
+            OSStateMachine_1.DebuggerActions.high_level_switch_breakpoint_group_to_low_level,
+        ]);
+        const willAutorun = actions.some(a => autorunActions.has(a.type));
+        for (const action of actions) {
+            this.doAction(action);
+        }
+        // If the state machine doesn't intend to auto-continue, surface the stop to the UI
+        if (!willAutorun) {
+            const event2 = new debugadapter_1.StoppedEvent('breakpoint', this.recentStopThreadId);
+            event2.body.allThreadsStopped = true;
+            this.sendEvent(event2);
+        }
+    }
+    /**
+     * Execute a single DebuggerAction.  All async paths are fire-and-forget
+     * (they schedule follow-up events back through osStateTransition).
+     */
+    doAction(action) {
+        if (!this.miDebugger)
+            return;
+        switch (action.type) {
+            // ------------------------------------------------------------------
+            // check_if_kernel_yet: read PC; if in kernel range → AT_KERNEL
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.check_if_kernel_yet: {
+                this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
+                    const pc = (0, addrSpace_1.parseAddr)(regs[0]?.value ?? '');
+                    if (pc !== undefined && (0, addrSpace_1.isKernelAddr)(pc, this.kernelMemoryRanges)) {
+                        this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_KERNEL));
+                    }
+                    else {
+                        // still in user space — keep stepping
+                        this.miDebugger.stepInstruction();
+                    }
+                }).catch(err => {
+                    console.error('[ardb] check_if_kernel_yet failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // check_if_user_yet: read PC; if in user range → AT_USER
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.check_if_user_yet: {
+                this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
+                    const pc = (0, addrSpace_1.parseAddr)(regs[0]?.value ?? '');
+                    if (pc !== undefined && (0, addrSpace_1.isUserAddr)(pc, this.userMemoryRanges)) {
+                        this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_USER));
+                    }
+                    else {
+                        // still in kernel — keep stepping
+                        this.miDebugger.stepInstruction();
+                    }
+                }).catch(err => {
+                    console.error('[ardb] check_if_user_yet failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // check_if_kernel_to_user_border_yet: are we at a border BP in kernel→user direction?
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.check_if_kernel_to_user_border_yet: {
+                this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(stack => {
+                    if (stack.length === 0)
+                        return;
+                    const topFrame = stack[0];
+                    const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
+                    if (!currentGroup?.borders)
+                        return;
+                    for (const border of currentGroup.borders) {
+                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(border.filepath)
+                            && topFrame.line === border.line) {
+                            this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            return;
+                        }
+                    }
+                }).catch(err => {
+                    console.error('[ardb] check_if_kernel_to_user_border_yet failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // check_if_user_to_kernel_border_yet: are we at a border BP in user→kernel direction?
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.check_if_user_to_kernel_border_yet: {
+                this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(stack => {
+                    if (stack.length === 0)
+                        return;
+                    const topFrame = stack[0];
+                    const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
+                    if (!currentGroup?.borders)
+                        return;
+                    for (const border of currentGroup.borders) {
+                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(border.filepath)
+                            && topFrame.line === border.line) {
+                            this.osStateTransition(new OSStateMachine_1.OSEvent(OSStateMachine_1.OSEvents.AT_USER_TO_KERNEL_BORDER));
+                            return;
+                        }
+                    }
+                }).catch(err => {
+                    console.error('[ardb] check_if_user_to_kernel_border_yet failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // start_consecutive_single_steps: step one instruction (more will follow via STOPPED)
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.start_consecutive_single_steps: {
+                this.miDebugger.stepInstruction().catch(err => {
+                    console.error('[ardb] stepInstruction failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // try_get_next_breakpoint_group_name: check current frame against hook BPs;
+            // if matched, run the hook behavior function to get the next process name.
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.try_get_next_breakpoint_group_name: {
+                this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(async (stack) => {
+                    if (stack.length === 0 || !this.breakpointGroups)
+                        return;
+                    const topFrame = stack[0];
+                    const currentGroup = this.breakpointGroups.getCurrentBreakpointGroup();
+                    if (!currentGroup)
+                        return;
+                    for (const hook of currentGroup.hooks) {
+                        if (topFrame.file && path.normalize(topFrame.file) === path.normalize(hook.breakpoint.file ?? '')
+                            && topFrame.line === hook.breakpoint.line) {
+                            this.currentHook = hook;
+                            try {
+                                // Get variables to pass to hook function
+                                const vars = await this.miDebugger.getStackVariables(this.recentStopThreadId, 0);
+                                const varMap = {};
+                                for (const v of vars) {
+                                    varMap[v.name] = v.valueStr ?? '';
+                                }
+                                // Execute hook behavior to get next breakpoint group name
+                                const fn = eval(hook.behavior);
+                                const nextGroupName = fn(varMap);
+                                if (nextGroupName) {
+                                    this.breakpointGroups.setNextBreakpointGroup(nextGroupName);
+                                }
+                            }
+                            catch (err) {
+                                console.error('[ardb] hook behavior execution failed:', err);
+                            }
+                            return;
+                        }
+                    }
+                }).catch(err => {
+                    console.error('[ardb] try_get_next_breakpoint_group_name failed:', err);
+                });
+                break;
+            }
+            // ------------------------------------------------------------------
+            // low_level_switch_breakpoint_group_to_high_level:
+            //   kernel → user: switch to the previously determined user process group
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.low_level_switch_breakpoint_group_to_high_level: {
+                if (!this.breakpointGroups)
+                    break;
+                const nextGroup = this.breakpointGroups.getNextBreakpointGroup();
+                // After switching to user, the "next" group becomes kernel (default fallback)
+                const kernelGroup = this.breakpointGroups.getCurrentBreakpointGroupName();
+                this.breakpointGroups.updateCurrentBreakpointGroup(nextGroup, /* continueAfterUpdate */ true);
+                this.breakpointGroups.setNextBreakpointGroup(kernelGroup);
+                break;
+            }
+            // ------------------------------------------------------------------
+            // high_level_switch_breakpoint_group_to_low_level:
+            //   user → kernel: switch back to kernel breakpoint group
+            // ------------------------------------------------------------------
+            case OSStateMachine_1.DebuggerActions.high_level_switch_breakpoint_group_to_low_level: {
+                if (!this.breakpointGroups)
+                    break;
+                const nextGroup = this.breakpointGroups.getNextBreakpointGroup();
+                // After switching to kernel, default next group is the user process we just left
+                const userGroup = this.breakpointGroups.getCurrentBreakpointGroupName();
+                this.breakpointGroups.updateCurrentBreakpointGroup(nextGroup, /* continueAfterUpdate */ true);
+                this.breakpointGroups.setNextBreakpointGroup(userGroup);
+                break;
+            }
+            default:
+                console.warn('[ardb] unknown action type:', action.type);
+        }
     }
     // -----------------------------------------------------------------------
     // Event helpers

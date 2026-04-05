@@ -106,6 +106,48 @@ class MI2 extends events_1.EventEmitter {
             }, reject);
         });
     }
+    // Attach to a running local process (by PID or process name)
+    attach(cwd, executable, target, autorun = []) {
+        return new Promise((resolve, reject) => {
+            if (executable && !path.isAbsolute(executable))
+                executable = path.join(cwd, executable);
+            const args = this.preargs.concat(this.extraargs || []);
+            this.process = ChildProcess.spawn(this.application, args, { cwd: cwd, env: this.procEnv });
+            this.process.stdout?.on("data", this.stdout.bind(this));
+            this.process.stderr?.on("data", this.stderr.bind(this));
+            this.process.on("exit", () => this.emit("quit"));
+            this.process.on("error", err => this.emit("launcherror", err));
+            const promises = this.initCommands(target, cwd, true);
+            if (executable)
+                promises.push(this.sendCommand('file-exec-and-symbols "' + escape(executable) + '"'));
+            promises.push(this.sendCommand("target-attach " + target));
+            promises.push(...autorun.map(value => this.sendUserInput(value)));
+            Promise.all(promises).then(() => {
+                this.emit("debug-ready");
+                resolve(undefined);
+            }, reject);
+        });
+    }
+    // Connect to a GDB remote stub (e.g. QEMU gdbserver via "target remote :port")
+    connect(cwd, executable, target, autorun = []) {
+        return new Promise((resolve, reject) => {
+            if (executable && !path.isAbsolute(executable))
+                executable = path.join(cwd, executable);
+            const args = this.preargs.concat(this.extraargs || []);
+            this.process = ChildProcess.spawn(this.application, args, { cwd: cwd, env: this.procEnv });
+            this.process.stdout?.on("data", this.stdout.bind(this));
+            this.process.stderr?.on("data", this.stderr.bind(this));
+            this.process.on("exit", () => this.emit("quit"));
+            this.process.on("error", err => this.emit("launcherror", err));
+            const promises = this.initCommands(target, cwd, true);
+            promises.push(this.sendCommand("target-select remote " + target));
+            promises.push(...autorun.map(value => this.sendUserInput(value)));
+            Promise.all(promises).then(() => {
+                this.emit("debug-ready");
+                resolve(undefined);
+            }, reject);
+        });
+    }
     initCommands(target, cwd, attach = false) {
         const debuggerPath = path.posix.isAbsolute(cwd) ? path.posix : path.win32;
         if (!debuggerPath.isAbsolute(target))
