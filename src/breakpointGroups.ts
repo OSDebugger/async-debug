@@ -21,6 +21,9 @@ export interface IBreakpointGroupsSession {
 	filePathToBreakpointGroupNames: FunctionString;
 	breakpointGroupNameToDebugFilePaths: FunctionString;
 	showInformationMessage(msg: string): void;
+	// Called after all breakpoints for the new group have been (re-)inserted into GDB.
+	// The caller should send BreakpointEvent('changed') for each restored breakpoint.
+	onBreakpointsRestored(results: Array<[boolean, Breakpoint]>): void;
 }
 
 export class Border {
@@ -167,49 +170,60 @@ export class BreakpointGroups {
 			oldIndex = this.groups.length - 1;
 		}
 
-		this.groups[oldIndex].setBreakpointsArguments.forEach((e) => {
-			this.session.miDebugger.clearBreakPoints(e.source.path);
-		});
-
-		const currentBreakpointGroupSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.getCurrentBreakpointGroupName());
-		for (const f of currentBreakpointGroupSymbolFiles) {
-			this.session.miDebugger.removeSymbolFile(f);
-		}
-
-		const nextBreakpointGroupSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[newIndex].name);
-		for (const f of nextBreakpointGroupSymbolFiles) {
-			this.session.miDebugger.addSymbolFile(f);
-		}
-
-		const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
-			return this.session.miDebugger.clearBreakPoints(args.source.path).then(
-				() => {
-					const path = args.source.path;
-					const all = args.breakpoints!.map((brk) => {
-						return this.session.miDebugger.addBreakPoint({
-							file: path,
-							line: brk.line,
-							condition: brk.condition ?? "",
-							countCondition: brk.hitCondition,
-							logMessage: brk.logMessage
-						});
-					});
-					return Promise.all(all);
-				},
-				(_msg) => {
-					// TODO: handle error
-				}
-			);
-		});
-
-		Promise.all(breakpointPromises).then(() => {
-			if (continueAfterUpdate) {
-				this.session.miDebugger.continue();
-			}
-		});
-
+		// Update name immediately so callers see the new group right away.
 		this.currentBreakpointGroupName = this.groups[newIndex].name;
 		this.session.showInformationMessage("breakpoint group changed to " + updateTo);
+
+		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
+		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
+			(e) => this.session.miDebugger.clearBreakPoints(e.source.path)
+		);
+
+		// 2. Unload old symbol files, load new symbol files — must complete before
+		//    re-inserting breakpoints so GDB can resolve source locations correctly.
+		const oldSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[oldIndex].name);
+		const newSymbolFiles: string[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(this.groups[newIndex].name);
+
+		Promise.all(clearOldPromises)
+			.then(() => Promise.all(oldSymbolFiles.map(f => this.session.miDebugger.removeSymbolFile(f).catch(() => {}))))
+			.then(() => Promise.all(newSymbolFiles.map(f => this.session.miDebugger.addSymbolFile(f).catch(() => {}))))
+			.then(() => {
+				// 3. Re-insert new group's breakpoints
+				const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
+					return this.session.miDebugger.clearBreakPoints(args.source.path).then(
+						() => {
+							const path = args.source.path;
+							const all = args.breakpoints!.map((brk) => {
+								return this.session.miDebugger.addBreakPoint({
+									file: path,
+									line: brk.line,
+									condition: brk.condition ?? "",
+									countCondition: brk.hitCondition,
+									logMessage: brk.logMessage
+								});
+							});
+							return Promise.all(all);
+						},
+						(_msg) => [] as Array<[boolean, Breakpoint]>
+					);
+				});
+				return Promise.all(breakpointPromises);
+			})
+			.then((nestedResults) => {
+				// 4. Notify session to send BreakpointEvent('changed') for each restored BP
+				const flat = (nestedResults as Array<Array<[boolean, Breakpoint]>>).flat();
+				this.session.onBreakpointsRestored(flat);
+				// 5. Now safe to continue execution
+				if (continueAfterUpdate) {
+					this.session.miDebugger.continue();
+				}
+			})
+			.catch(err => {
+				console.error('[ardb] updateCurrentBreakpointGroup failed:', err);
+				if (continueAfterUpdate) {
+					this.session.miDebugger.continue();
+				}
+			});
 	}
 
 	// there should NOT be a `setCurrentBreakpointGroupName()` because changing the name also
