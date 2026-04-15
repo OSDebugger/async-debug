@@ -1,3 +1,4 @@
+//src/extension.ts
 import * as vscode from 'vscode';
 import { ARDDebugAdapterFactory } from './debugAdapter';
 import { AsyncInspectorPanel } from './webview/asyncInspectorPanel';

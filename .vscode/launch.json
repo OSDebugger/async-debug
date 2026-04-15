@@ -51,6 +51,16 @@
         "<node_internals>/**"
       ],
       "preLaunchTask": "npm: compile"
+    },
+    {
+      "name": "Attach to GDB Python",
+      "type": "python",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 5678
+      },
+      "justMyCode": false
     }
   ],
   "compounds": [

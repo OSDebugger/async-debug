@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+//src/extension.ts
 const vscode = __importStar(require("vscode"));
 const debugAdapter_1 = require("./debugAdapter");
 const asyncInspectorPanel_1 = require("./webview/asyncInspectorPanel");

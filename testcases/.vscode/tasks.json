@@ -1,0 +1,39 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "cargo build tick",
+            "type": "shell",
+            "command": "cargo build --bin tick",
+            "options": {
+                "cwd": "/home/user/embassy/examples/std"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "cargo build tick_cancel",
+            "type": "shell",
+            "command": "cargo build --bin tick_cancel",
+            "options": {
+                "cwd": "/home/user/embassy/examples/std"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        }
+    ]
+}

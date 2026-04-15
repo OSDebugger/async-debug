@@ -3,6 +3,26 @@ import re
 import struct
 import gdb
 import json
+# -------------------------
+# Debug runtime_trace.py
+# -------------------------
+# import sys
+
+# if os.environ.get("ARDB_PY_DEBUG") == "1":
+#     preferred = os.environ.get("ARDB_DEBUGPY_PYTHON")
+
+#     if preferred and os.path.exists(preferred):
+#         sys.executable = preferred
+#     elif (not sys.executable) or (not os.path.exists(sys.executable)) or sys.executable == "/usr/bin/python":
+#         if os.path.exists("/usr/bin/python3"):
+#             sys.executable = "/usr/bin/python3"
+
+#     import debugpy
+#     debugpy.listen(("127.0.0.1", 5678))
+#     print(f"[runtime_trace] sys.executable = {sys.executable}")
+#     print("[runtime_trace] waiting for debugger on 5678...")
+#     debugpy.wait_for_client()
+#     print("[runtime_trace] debugger attached.")
 
 # -------------------------
 # User-facing knobs
@@ -55,6 +75,24 @@ def _get_or_make_coro_id(poll_sym: str, this_ptr: int):
         _CO_POLL_SEQ[cid] = 0
         return cid, True
     return cid, False
+
+
+def _find_nearby_coro(poll_sym: str, this_ptr: int, max_offset: int = 128) -> int | None:
+    """
+    Search for an existing CID whose (poll_sym, stored_ptr) has the same
+    poll_sym and a stored_ptr within ±max_offset of this_ptr.
+
+    This handles the case where Pin/reference wrapping introduces a small
+    pointer offset for the same underlying coroutine instance.
+
+    Returns the matching CID, or None if no nearby match is found.
+    """
+    if not this_ptr:
+        return None
+    for (sym, stored_ptr), cid in _CO_BY_KEY.items():
+        if sym == poll_sym and abs(int(stored_ptr) - int(this_ptr)) <= max_offset:
+            return cid
+    return None
 
 def _push_coro(cid: int) -> int:
     tid = _thread_id()
@@ -112,6 +150,9 @@ _WHITELIST_PATH = None
 _WHITELIST_ADDR_MAP = {}             # addr -> exact symbol
 _WHITELIST_ADDR_READY = False
 
+# Async symbol set from grouped whitelist (symbols classified as "async")
+_ASYNC_SYMBOL_SET = None   # set[str] | None
+
 _EVENTS_INSTALLED = False
 
 
@@ -123,7 +164,13 @@ CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
 def _ptr_size() -> int:
-    return gdb.lookup_type("void").pointer().sizeof
+    try:
+        return gdb.lookup_type("char").pointer().sizeof
+    except gdb.error:
+        try:
+            return gdb.lookup_type("unsigned char").pointer().sizeof
+        except gdb.error:
+            return 8
 
 def _read_ptr(addr: int) -> int:
     inf = gdb.selected_inferior()
@@ -143,8 +190,32 @@ def _current_function_name() -> str:
     f = gdb.selected_frame()
     return f.name() or "<unknown>"
 
-def _info_symbol_raw(addr: int) -> str:
-    return gdb.execute(f"info symbol {addr:#x}", to_string=True).strip()
+def _normalize_addr(addr):
+    try:
+        a = int(addr)
+    except Exception:
+        try:
+            a = int(str(addr), 0)
+        except Exception:
+            return None
+
+    try:
+        ptr_bits = _ptr_size() * 8
+        mask = (1 << ptr_bits) - 1
+        a &= mask
+    except Exception:
+        pass
+
+    return a
+
+def _info_symbol_raw(addr):
+    a = _normalize_addr(addr)
+    if a is None:
+        return ""
+    try:
+        return gdb.execute(f"info symbol 0x{a:x}", to_string=True).strip()
+    except gdb.error:
+        return ""
 
 def _info_symbol_name(addr: int) -> str:
     s = _info_symbol_raw(addr)
@@ -218,14 +289,6 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
     if m:
         return _reg_u64(m.group(1))
 
-    # call *disp(%reg)
-    m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%([a-z0-9]+)\)", s)
-    if m:
-        disp_s, base = m.group(1), m.group(2)
-        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
-        slot = _reg_u64(base) + disp
-        return _read_ptr(slot)
-
     # call *disp(%rip)  (x86_64: ff 15 disp32 ; instruction length is 6 bytes)
     m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%rip\)", s)
     if m:
@@ -233,6 +296,14 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
         pc = _current_pc()
         slot = pc + 6 + disp  # RIP-relative base = next instruction
+        return _read_ptr(slot)
+
+    # call *disp(%reg)
+    m = re.search(r"call\w*\s+\*([\-0-9a-fx]+)\(\%([a-z0-9]+)\)", s)
+    if m:
+        disp_s, base = m.group(1), m.group(2)
+        disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
+        slot = _reg_u64(base) + disp
         return _read_ptr(slot)
 
     return None
@@ -247,6 +318,53 @@ def _pollsym_to_envtype(poll_sym: str) -> str | None:
     s = s.replace("{async_fn#", "{async_fn_env#")
     s = s.replace("{async_block#", "{async_block_env#")
     return s if s != poll_sym else None
+
+
+def _read_env_state(poll_sym: str, this_ptr: int):
+    """
+    Read the state discriminant from an async env struct.
+
+    Returns a value suitable for the snapshot 'state' field:
+      - An integer (the raw __state discriminant) if readable
+      - A string like "N/A" if the env type can't be resolved
+      - Falls back to reading the first field of the env struct
+        if __state is not present (e.g. manual Future impls)
+    """
+    if not this_ptr:
+        return "N/A"
+
+    env_type_name = _pollsym_to_envtype(poll_sym)
+    if not env_type_name:
+        return "N/A"
+
+    try:
+        env_t = gdb.lookup_type(env_type_name)
+        env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
+
+        # Primary: try the well-known __state field
+        try:
+            return int(env_val["__state"])
+        except Exception:
+            pass
+
+        # Fallback: read the first field as discriminant
+        # (common for manually implemented futures where the first
+        #  field is often a bool or enum indicating completion)
+        try:
+            fields = env_t.fields()
+            if fields:
+                first_val = env_val[fields[0].name]
+                first_code = first_val.type.strip_typedefs().code
+                if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL,
+                                  gdb.TYPE_CODE_ENUM):
+                    return int(first_val)
+        except Exception:
+            pass
+
+    except Exception:
+        pass
+
+    return "N/A"
 
 def _try_read_awaitee_from_current_poll(poll_sym: str):
     env_type_name = _pollsym_to_envtype(poll_sym)
@@ -344,8 +462,8 @@ def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
         if sym is None:
             return None
         v = sym.value()
-        voidp = gdb.lookup_type("void").pointer()
-        return int(v.cast(voidp))
+        voidp = gdb.lookup_type("char").pointer()
+        return int(v.cast(charp))
     except Exception:
         return None
 
@@ -454,6 +572,99 @@ def _log_ard(message: str, to_console: bool = False):
 
 def _is_pollish_name(sym_name: str) -> bool:
     return ("::poll" in sym_name) or ("{async_fn#" in sym_name) or ("{async_block#" in sym_name)
+
+def _is_async_symbol(sym_name: str) -> bool:
+    """
+    Check whether a symbol is an async function.
+    Uses the same criteria as gen_whitelist._classify_symbol:
+    1. Name contains {async_fn# or {async_block# (compiler-generated async)
+    2. Symbol is in the async set from the grouped whitelist (e.g. manual Future::poll impls)
+    """
+    if ("{async_fn#" in sym_name) or ("{async_block#" in sym_name):
+        return True
+    if _ASYNC_SYMBOL_SET is not None and sym_name in _ASYNC_SYMBOL_SET:
+        return True
+    return False
+
+def _load_async_symbol_set_from_grouped():
+    """
+    Load the async symbol set from poll_functions_grouped.json.
+    Called after whitelist generation or when the grouped JSON is first read.
+    """
+    global _ASYNC_SYMBOL_SET
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        return
+    grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+    if not os.path.exists(grouped_path):
+        return
+    try:
+        with open(grouped_path, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        async_set = set()
+        for crate_info in data.get("crates", {}).values():
+            for sym in crate_info.get("symbols", []):
+                if sym.get("kind") == "async":
+                    async_set.add(sym["name"])
+        _ASYNC_SYMBOL_SET = async_set
+    except Exception:
+        pass
+
+
+def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
+    """
+    Recursively unwrap a GDB value to extract the raw memory address.
+
+    Handles common Rust wrapper types:
+      - Pin<P>      → struct with '__pointer' or 'pointer' field
+      - Box<T>      → struct with 'pointer' field (Unique) containing '*mut T'
+      - &mut T / &T → TYPE_CODE_REF / TYPE_CODE_RVALUE_REF
+      - *mut T / *const T → TYPE_CODE_PTR
+      - Unique<T>   → struct with 'pointer' field (NonNull) → inner '*const T'
+      - NonNull<T>  → struct with 'pointer' field → '*const T'
+
+    Recursion depth is capped to avoid infinite loops on pathological types.
+    """
+    if depth > 8:
+        return int(val) if val else 0
+
+    try:
+        ty = val.type.strip_typedefs()
+        code = ty.code
+
+        # Pointer or reference — this is what we want
+        if code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF):
+            return int(val)
+
+        # Struct — drill into known wrapper fields
+        if code == gdb.TYPE_CODE_STRUCT:
+            # Try well-known inner-pointer field names in priority order
+            for field_name in ('__pointer', 'pointer', 'data', 'inner', 'value'):
+                try:
+                    inner = val[field_name]
+                    result = _extract_raw_ptr(inner, depth + 1)
+                    if result > 0xffff:  # looks like a valid pointer
+                        return result
+                except Exception:
+                    pass
+
+            # Generic single-field struct (common in Rust newtypes)
+            try:
+                fields = ty.fields()
+                if len(fields) == 1:
+                    inner = val[fields[0].name]
+                    result = _extract_raw_ptr(inner, depth + 1)
+                    if result > 0xffff:
+                        return result
+            except Exception:
+                pass
+
+        # Fallback — direct integer conversion
+        result = int(val)
+        return result if result > 0xffff else 0
+    except Exception:
+        return 0
+
 
 def _callee_candidates(addr: int) -> list[str]:
     cands = []
@@ -658,6 +869,8 @@ class ARDTraceCommand(gdb.Command):
 
     def invoke(self, arg, from_tty):
         sym = arg.strip()
+        if len(sym) >= 2 and sym[0] == sym[-1] and sym[0] in ("'", '"'):
+            sym = sym[1:-1]
         if not sym:
             gdb.write("Usage: ardb-trace <poll-symbol>\n")
             return
@@ -750,6 +963,8 @@ class ARDGenWhitelistCommand(gdb.Command):
             return
         try:
             gen_default_whitelist()
+            # Populate the async symbol set from the newly generated grouped JSON
+            _load_async_symbol_set_from_grouped()
         except Exception as e:
             gdb.write(f"[ARD] gen_default_whitelist failed: {e}\n")
 
@@ -771,22 +986,16 @@ class ARDGetSnapshotCommand(gdb.Command):
             "path": []
         }
         
-        # 1. Extract the asynchronous shadow stack (Coroutines)
+        # 1. Extract the shadow stack (traced coroutines and functions)
         top_async_func = ""
         for cid in stack:
             poll_sym, this_ptr = _CO_META.get(cid, ("<unknown>", 0))
             seq = _CO_POLL_SEQ.get(cid, 0)
             top_async_func = poll_sym
-            
-            state_val = "N/A"
-            env_type_name = _pollsym_to_envtype(poll_sym)
-            if env_type_name and this_ptr:
-                try:
-                    env_t = gdb.lookup_type(env_type_name)
-                    env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
-                    state_val = int(env_val["__state"])
-                except Exception:
-                    pass
+
+            node_type = "async" if _is_async_symbol(poll_sym) else "sync"
+
+            state_val = _read_env_state(poll_sym, this_ptr)
 
             # Try to get source location for this async function
             async_file = ""
@@ -804,7 +1013,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                 pass
 
             snapshot["path"].append({
-                "type": "async",
+                "type": node_type,
                 "cid": cid,
                 "func": poll_sym,
                 "addr": hex(this_ptr),
@@ -815,51 +1024,136 @@ class ARDGetSnapshotCommand(gdb.Command):
                 "line": async_line
             })
             
-        # 2. Extract the synchronous tail (Physical frames above the top coroutine)
-        sync_tail = []
+        # 2. Extract the physical stack tail (frames above the top traced function).
+        #    Only do this if the shadow stack is non-empty; if nothing has been
+        #    traced yet, we should not fabricate nodes from physical frames.
+        phys_tail = []
+        shadow_cids = set(stack)  # CIDs already on the shadow stack
+        if not stack:
+            json_output = json.dumps(snapshot) + "\n"
+            gdb.write(json_output)
+            temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+            if temp_dir:
+                snapshot_path = os.path.join(os.getcwd(), temp_dir, "ardb_snapshot.json")
+                try:
+                    with open(snapshot_path, "w", encoding="utf-8") as f:
+                        f.write(json_output)
+                except Exception:
+                    pass
+            return
         try:
-            # Start from the currently selected frame (deepest)
-            frame = gdb.selected_frame()
+            saved_frame = gdb.selected_frame()
+            frame = saved_frame
             while frame:
                 fname = frame.name()
-                
-                # Stop if we reach the poll entry of the top async function 
+
+                # Stop if we reach the entry of the top traced function
                 # to avoid duplication with the shadow stack
                 if fname == top_async_func:
                     break
-                
+
                 if fname:
+                    frame_type = "async" if _is_async_symbol(fname) else "sync"
+
                     # Get source location from the frame
-                    sync_file = ""
-                    sync_fullname = ""
-                    sync_line = 0
+                    phys_file = ""
+                    phys_fullname = ""
+                    phys_line = 0
                     try:
                         sal = frame.find_sal()
                         if sal and sal.symtab:
-                            sync_file = sal.symtab.filename or ""
-                            sync_fullname = sal.symtab.fullname() if hasattr(sal.symtab, 'fullname') else sync_file
-                            sync_line = sal.line or 0
+                            phys_file = sal.symtab.filename or ""
+                            phys_fullname = sal.symtab.fullname() if hasattr(sal.symtab, 'fullname') else phys_file
+                            phys_line = sal.line or 0
                     except Exception:
                         pass
 
-                    sync_tail.append({
-                        "type": "sync",
-                        "cid": None,
+                    node_cid = None
+                    node_poll = 0
+                    node_state = "NON-ASYNC"
+                    node_addr = hex(frame.pc())
+
+                    if frame_type == "async":
+                        # For async frames, try to read the env ptr from the
+                        # frame's debug info (first argument / self).
+                        # $rdi is unreliable for non-entry frames.
+                        node_state = "N/A"
+                        this_ptr = 0
+                        try:
+                            frame.select()
+                            block = frame.block()
+                            for sym in block:
+                                if sym.is_argument:
+                                    val = frame.read_var(sym)
+                                    # The first arg is typically Pin<&mut Self>.
+                                    # Pin { __pointer: &mut T } — we need the
+                                    # raw pointer inside.  Try to drill through
+                                    # Pin and reference layers.
+                                    this_ptr = _extract_raw_ptr(val)
+                                    break
+                        except Exception:
+                            pass
+                        # Fallback to $rdi if debug info failed
+                        if not this_ptr:
+                            try:
+                                frame.select()
+                                this_ptr = _reg_u64("rdi")
+                            except Exception:
+                                pass
+
+                        if this_ptr:
+                            try:
+                                # First try exact match
+                                cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
+
+                                # If we just created a new CID, check if there's
+                                # an existing CID with a nearby address for the
+                                # same function.  Pin wrapping can shift the
+                                # pointer by a small offset, so we merge to
+                                # prevent identity fragmentation.
+                                if is_new:
+                                    nearby = _find_nearby_coro(fname, this_ptr)
+                                    if nearby is not None and nearby != cid_phys:
+                                        # Merge: discard the newly created CID,
+                                        # reuse the nearby one
+                                        key_new = (fname, int(this_ptr))
+                                        _CO_BY_KEY.pop(key_new, None)
+                                        _CO_META.pop(cid_phys, None)
+                                        _CO_POLL_SEQ.pop(cid_phys, None)
+                                        cid_phys = nearby
+
+                                if cid_phys not in shadow_cids:
+                                    node_cid = cid_phys
+                                    node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
+                                    node_addr = hex(this_ptr)
+                                    node_state = _read_env_state(fname, this_ptr)
+                            except Exception:
+                                pass
+
+                    phys_tail.append({
+                        "type": frame_type,
+                        "cid": node_cid,
                         "func": fname,
-                        "addr": hex(frame.pc()),
-                        "poll": 0,
-                        "state": "NON-ASYNC",
-                        "file": sync_file,
-                        "fullname": sync_fullname,
-                        "line": sync_line
+                        "addr": node_addr,
+                        "poll": node_poll,
+                        "state": node_state,
+                        "file": phys_file,
+                        "fullname": phys_fullname,
+                        "line": phys_line
                     })
                 frame = frame.older()
+
+            # Restore the originally selected frame
+            try:
+                saved_frame.select()
+            except Exception:
+                pass
         except Exception:
             pass
-            
-        # Physical frames are captured in reverse order (deepest first), 
+
+        # Physical frames are captured in reverse order (deepest first),
         # so we reverse them before appending to the path.
-        snapshot["path"].extend(reversed(sync_tail))
+        snapshot["path"].extend(reversed(phys_tail))
             
         # Output pure JSON for the Debug Adapter
         json_output = json.dumps(snapshot) + "\n"
@@ -874,6 +1168,154 @@ class ARDGetSnapshotCommand(gdb.Command):
                     f.write(json_output)
             except Exception:
                 pass  # Best-effort file write, don't fail if it doesn't work
+
+class ARDGetGroupedWhitelistCommand(gdb.Command):
+    """
+    Return the grouped whitelist JSON (crate-level grouping with user-crate detection).
+    Reads poll_functions_grouped.json from the temp directory.
+    Usage: ardb-get-whitelist-grouped
+    """
+    def __init__(self):
+        super().__init__("ardb-get-whitelist-grouped", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if not temp_dir:
+            gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
+            return
+
+        grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+        if not os.path.exists(grouped_path):
+            gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
+            return
+
+        try:
+            with open(grouped_path, "r", encoding="utf-8") as fp:
+                content = fp.read()
+            # Ensure async symbol set is populated when grouped whitelist is read
+            if _ASYNC_SYMBOL_SET is None:
+                _load_async_symbol_set_from_grouped()
+            gdb.write(content + "\n")
+        except Exception as e:
+            gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
+
+
+class ARDUpdateWhitelistCommand(gdb.Command):
+    """
+    Update the runtime whitelist based on enabled crates.
+    Reads the grouped JSON, filters to enabled crates, writes flat poll_functions.txt,
+    and reloads the whitelist.
+    Usage: ardb-update-whitelist {"enabled_crates": ["my_app", "my_lib"]}
+    """
+    def __init__(self):
+        super().__init__("ardb-update-whitelist", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_PATH
+
+        temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+        if not temp_dir:
+            gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
+            return
+
+        cwd = os.getcwd()
+        grouped_path = os.path.join(cwd, temp_dir, "poll_functions_grouped.json")
+        flat_path = os.path.join(cwd, temp_dir, "poll_functions.txt")
+
+        if not os.path.exists(grouped_path):
+            gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
+            return
+
+        # Parse the enabled crates from the argument
+        arg = arg.strip()
+        if not arg:
+            gdb.write('Usage: ardb-update-whitelist {"enabled_crates": ["crate1", ...]}\n')
+            return
+
+        try:
+            payload = json.loads(arg)
+            enabled_crates = set(payload.get("enabled_crates", []))
+        except Exception as e:
+            gdb.write(f'[ARD] failed to parse argument: {e}\n')
+            return
+
+        # Read grouped JSON
+        try:
+            with open(grouped_path, "r", encoding="utf-8") as fp:
+                grouped_data = json.load(fp)
+        except Exception as e:
+            gdb.write(f'[ARD] failed to read grouped whitelist: {e}\n')
+            return
+
+        # Write filtered flat whitelist
+        idx = 0
+        try:
+            with open(flat_path, "w", encoding="utf-8") as fp:
+                for crate_name, crate_info in grouped_data.get("crates", {}).items():
+                    if crate_name not in enabled_crates:
+                        continue
+                    for sym_info in crate_info.get("symbols", []):
+                        fp.write(f"{idx} {sym_info['name']}\n")
+                        idx += 1
+        except Exception as e:
+            gdb.write(f'[ARD] failed to write filtered whitelist: {e}\n')
+            return
+
+        # Reload the whitelist
+        try:
+            wl_exact, wl_prefix = _load_whitelist_file(flat_path)
+            _WHITELIST_EXACT = wl_exact
+            _WHITELIST_PREFIX = wl_prefix
+            _WHITELIST_PATH = flat_path
+            _invalidate_whitelist_addrs()
+        except Exception as e:
+            gdb.write(f'[ARD] failed to reload whitelist: {e}\n')
+            return
+
+        gdb.write(f'[ARD] whitelist updated: {len(enabled_crates)} crates enabled, {idx} symbols -> {flat_path}\n')
+
+
+class ARDInferTraceRootCommand(gdb.Command):
+    """
+    Infer the trace root by walking the GDB stack from the current breakpoint position.
+    Finds the outermost user-crate async function in the call stack.
+    Usage: ardb-infer-trace-root
+    """
+    def __init__(self):
+        super().__init__("ardb-infer-trace-root", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        from async_rust_debugger.static_analysis.gen_whitelist import (
+            _extract_crate_name, KNOWN_FRAMEWORK_CRATES
+        )
+
+        all_async_frames = []
+        outermost_user_async = None
+        max_frames = 100
+
+        try:
+            frame = gdb.selected_frame()
+            count = 0
+            while frame and count < max_frames:
+                fname = frame.name()
+                if fname and ("{async_fn#" in fname or "{async_block#" in fname):
+                    all_async_frames.append(fname)
+                    # Check if this is a user-crate async function
+                    crate_name = _extract_crate_name(fname)
+                    if crate_name not in KNOWN_FRAMEWORK_CRATES:
+                        outermost_user_async = fname  # keep overwriting → outermost wins
+                frame = frame.older()
+                count += 1
+        except Exception:
+            pass
+
+        result = {
+            "trace_root": outermost_user_async,
+            "all_async_frames": all_async_frames,
+        }
+
+        gdb.write(json.dumps(result) + "\n")
+
 
 # -------------------------
 # Entry
@@ -890,6 +1332,9 @@ def install():
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
     ARDGetSnapshotCommand()
+    ARDGetGroupedWhitelistCommand()
+    ARDUpdateWhitelistCommand()
+    ARDInferTraceRootCommand()
 
     if not _EVENTS_INSTALLED:
         try:
@@ -902,4 +1347,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root\n")

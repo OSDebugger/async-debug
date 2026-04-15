@@ -1,0 +1,476 @@
+# Release Notes
+
+## Version 1.3.0
+
+This release is mostly internal cleanups, plus support for `portable-atomic` and
+`critical-section`. The changes are basically size-neutral; ARMv6-M targets get
+slightly smaller, fancier ARM targets are unchanged or slightly larger.
+
+No porting should be necessary unless I've made a mistake.
+
+### Atomics changes
+
+I've moved the OS over to `portable-atomic` internally and deprecated my version
+of it. To retain compatibility with earlier versions of `lilos`, I've enabled
+the `cortex-m` crate's `critical-section-single-core` feature. This generates
+effectively the same code that I had written by hand. This won't require changes
+in most applications, but it _will_ allow you to write atomic data structures
+that are portable to platforms other than `lilos`.
+
+**However,** if you were using some other `critical-section` implementation,
+this will break you. I don't consider this a breaking change in `lilos` because
+that other `critical-section` implementation was almost certainly wrong for
+`lilos`. In a future (breaking) version where we support SMP, I will switch
+`lilos` to a bring-your-own-critical-section model.
+
+Other than that, changes from the application's perspective are:
+
+- `lilos` now provides an implementation of `critical-section` for Rust embedded
+  crates that expect one. It works by globally disabling interrupts. (Note that
+  most crates that use `critical-section` are doing it to defend against _task
+  preemption,_ which we don't support.)
+
+- The `lilos::atomic` module is now deprecated, and I suggest using the
+  `portable-atomic` crate in its place.
+
+- Generated code tends to be a bit smaller.
+
+### Core API changes
+
+- `PeriodicGate::is_lagging` lets code detect if its timing loop is falling
+  behind. I've used this to skip display updates in a GUI when I/O operations
+  interfere with rendering.
+
+### Docs fixes
+
+- Fixed the described return type of `create_static_mutex!`. It's been wrong
+  since the macro was written, so the actual type isn't changing and no code
+  should break.
+
+- Fixed the example code for `PeriodicGate`, which was missing a `mut`.
+
+### Internals
+
+- Make `rustc` aware of the custom `cfg` values that we use under the hood, so
+  that it can detect typos in them. (I love this `rustc` feature.)
+
+- Several changes to eliminate new warnings in recent Clippy versions (should
+  not affect programs _using_ `lilos`). All these changes are to the text of
+  comments; Clippy having opinions about my comment wording is not my favorite.
+
+
+## Version 1.2.0
+
+Internal changes to data structures mean the OS minimum RAM requirement is down
+by 1/3 (from 60 bytes to 40), and programs I've tested are at least 100 bytes
+smaller in flash.
+
+### Core API changes
+
+- The original `list` module, and the `List` and `Node` types it contained, are
+  now deprecated. The new `lilos-list` crate provides a dramatically improved
+  version. In particular, this eliminates the need for the "two-phase init"
+  dance with pinned OS types that has haunted `lilos` from the early days.
+  - Uses of the old `List` type should use the new one from `lilos-list`.
+  - Instead of using macros to create a list, write: `pin!(List::new())`.
+  - The `Node` type is now private. Instead, the "contents" field that used to
+    be passed to `create_node!` is now a parameter to the `List::join` function.
+
+- Two-phase init of `Mutex` is now deprecated. You can now just write
+  `pin!(Mutex::create(something))`. (It's `create` and not `new` because I'm
+  preserving `new` in deprecated form for backwards compatibility with 1.1.) The
+  mutex creation macros still work.
+
+- It is now possible to create a `Mutex` or `List` in a `const fn` context,
+  including in a static initializer.
+
+### Non-Core API
+
+- The `lilos-list` crate exists now.
+
+- `rwlock` 0.2 uses the new `lilos-list` internally, and no longer requires (or
+  supports) two-phase init. I've removed the creation macro.
+
+- `semaphore` 0.2 uses the new `lilos-list` internally, and no longer requires (or
+  supports) two-phase init. I've removed the creation macro here, too.
+
+### Internal improvements
+
+- All internal use of lists has been rewritten to use `lilos-list`.
+
+- All code using any kind of lists, particularly timer lists, should now be
+  slightly smaller.
+
+- Removed an internal mostly-unused `Waker` implementation, reducing the base
+  flash requirement of the OS for applications that use the new `lilos-list`
+  module.
+
+- `spsc` now uses `get_unchecked` in a couple of places to avoid generating
+  bounds checks. This is the first place in `lilos` where I've used unsafe code
+  for performance or size reasons, and I hope not to make a habit of it.
+
+## Version 1.1
+
+### Bugfixes
+
+- It turns out that `List`'s ordering behavior has been subtly inconsistent for
+  quite some time, but in a way that was impossible to observe in previous
+  versions. The extensions to the `List` API (below) exposed this fact, and it
+  is fixed in this version.
+
+### Core API changes
+
+- `List` and `Node` now take a second generic parameter, `M`, which for
+  compatibility with 1.0 is defaulted to `()`. `M` allows arbitrary
+  application-defined metadata to be associated with each node if desired. This
+  is useful for implementing more complex synchronization primitives, and is not
+  used by the core OS directly.
+
+- The `create_node!` macro now allows its `waker` parameter to be omitted,
+  defaulting to `noop_waker`.
+
+- Renamed `List::wake_less_than` to `List::wake_thru`, since its behavior
+  (waking nodes with contents less than _or equal to_ a value) didn't match its
+  name. The old name is still available as an alias, for compatibility with 1.x,
+  but is deprecated.
+
+- Added `List::wake_one_if` as a generalized version of `List::wake_one` for
+  doing conditional wakes.
+
+- Added `List::wake_while` as a generalized version of `List::wake_thru`.
+  This has the side effect of making the order of nodes with the same
+  `contents` value observable, which is what exposed the list ordering bug
+  mentioned above (now fixed).
+
+- Added `List::is_empty` for checking if any nodes are waiting on a list. (It's
+  surprising that I haven't needed this before!)
+
+- The `CancelSafe` type from `lilos::mutex` is now available in `lilos::util`
+  independent of which features are turned on, to make it easier to use in
+  external lock types. `lilos::mutex::CancelSafe` is now an alias.
+
+### Non-Core API
+
+- Added an initial prototype of `lilos-rwlock`, a read-write lock.
+
+
+## Version 1.0.2
+
+This release should have no user-visible changes, only internal improvements.
+
+### New non-core APIs
+
+- Added an initial prototype of the `lilos-semaphore` crate, which provides a
+  counting semaphore designed for use with `lilos`. The crate's version is set
+  to `0.1.0` to reflect that it's not a final or released API just yet.
+
+### Internal / developer experience
+
+- Switched from `pin_project_lite` to `pin_project` to gain some features that
+  let me remove several unsafe blocks.
+
+- Switched back to a Cargo workspace.
+
+## Version 1.0.1
+
+The only user-facing change in this release is that the internal `AtomicExt`
+trait has been sealed, preventing implementation outside of `lilos`. This trait
+was never intended to be exposed, so I'm treating this as a bugfix and yanking
+1.0.0 to avoid confusing anyone.
+
+## Version 1.0.0
+
+After five years of development, I'm prepared to declare this a 1.0 release!
+
+For an example of the changes required to port from 0.3.x to 1.0, see [the
+upgrade commit in the Keypad:GO!
+firmware](https://github.com/cbiffle/keypad-go-firmware/commit/fffdf07a6b6a4038b8dd33be396fb16fb0271d58).
+
+Minimum Supported Rust Version is still 1.69, the earliest stable toolchain that
+can build `lilos` and applications. I'm relying on CI to check this and not
+using 1.69 for day-to-day development because it predates Cargo's sparse index
+fix.
+
+### Breaking changes and how to adapt to them
+
+- Time-related public API is now centralized in the `time` module. In earlier
+  versions this was split between `time` and `exec` for historical reasons. For
+  porting existing programs, look for uses of the `sleep_*`, `with_*`, and
+  `PeriodicGate` APIs; they have moved. I've been careful not to _rename_ any of
+  these APIs, so you should just need to replace the `exec` module with `time`
+  where you see compile errors.
+
+    - This renaming breaks compatibility with older versions of the debugger,
+      so, update.
+    - I removed some rarely-used and hard-to-make-correct corners of the API,
+      such as `every_until`. There is no direct replacement.
+
+- Renamed `spsc` and `handoff` split handle types: `Push` is now `Pusher`, `Pop`
+  is now `Popper`. (Because their old names sounded like what you'd name the
+  future type for _completing_ a push or pop, and I felt like that was
+  misleading.)
+
+- Totally reworked the Mutex API to further improve robustness in the face of
+  cancellation.
+  - The basic locking operation `lock` (and its friend `try_lock`) now return a
+    "permit" that can be used to do one synchronous thing to the guarded data.
+    (This operation was named `perform`/`try_perform` in 0.3.x.)
+  - If you need to access the guarded data on either side of an `await` point,
+    the `lock_assuming_cancel_safe` operation becomes available if you opt-in.
+    (This operation was named `lock` in all prior versions, but was renamed to
+    make it harder to grab by accident and easier to spot in code review.)
+
+- Removed operations that were marked as deprecated during the 0.3.x series:
+  `spsc::Push::push`. Please use `reserve` instead.
+
+- The `handoff` module is no longer part of the `lilos` crate. It has been
+  extracted into a separate `lilos-handoff` crate. If you want it, add that
+  crate to your project, and change references from `lilos::handoff` to
+  `lilos_handoff`. (It's incredibly useful, but has some gotchas, so it seemed
+  inappropriate in the core API.) Chances are pretty good that more "contrib"
+  code like this will appear in a separate crate soon.
+
+
+### Bug fixes
+
+- `spsc::Queue` was intended to `drop` any unpopped elements when the `Queue`
+  itself was dropped, but @OscarFKE pointed out that a typo prevented this from
+  actually happening! This has been fixed and queue contents should now be
+  dropped when you'd expect.
+
+
+### Internal bug fixes
+
+- Changes to the internal representation of the timer list may render
+  applications built with this version of `lilos` incompatible with older
+  versions of `lildbg`.
+
+- Fixed yet another soundness issue in `List`, where the `insert_and_wait`
+  operation was linking the `Node` into the `List` eagerly, before being polled.
+  This exposed it to being passed to `forget`, which would leave the list in a
+  corrupt state; once a future is polled, it's known to be pinned and can no
+  longer be forgotten. The good news is, the issues with `List` have all been in
+  slightly different areas, and I think it's rapidly approaching "correct." In
+  practice, it was impossible to trigger this bug unless you've got custom
+  synchronization primitives that use `List` directly, _and_ you do some very
+  strange things involving calling `forget` on futures.
+
+- Removed accidental double-drop of `Waker` in `List`. In `lilos` the `Drop`
+  impl for `Waker` is a no-op, which is how this went unnoticed for this long.
+  But it was still wrong, so, fixed now.
+
+- Some of the test suite run scripts had rotted, since I normally run the tests
+  in GDB. Thanks to @KoviRobi for the fix there.
+
+### Cleanups and future-proofing
+
+- The codebase should be ready for the `static_mut_refs` lint in Rust 1.77,
+  which will become a hard error in the eagerly-awaited 2024 edition.
+
+- Concrete future types are exposed for a few more operations, in case you need
+  to store them in a struct or something:
+  - `exec::Notify::until` and `exec::Notify::until_racy`
+
+- @helixbass contributed a build of the OS testsuite for STM32F3. While the
+  testsuite itself is processor-independent, this will make it easier for people
+  to use the testsuite on the popular STM32F3-DISCOVERY board.
+
+- @kovirobi fixed the units on `initialize_sys_tick`, which incorrectly claimed
+  to be in megahertz instead of hertz.
+
+- @kovirobi also contributed a QEMU-based test suite for CI, which is pretty
+  slick.
+
+- Code simplifications and cleanup from @mattfbacon.
+
+- Basic support for Cortex-M4 without hardfloat from @timokroeger.
+
+## Version 0.3.6
+
+- Fixed bug that meant `mutex` wouldn't build if you didn't also have `handoff`
+  enabled. Applications relying on default features wouldn't hit this since
+  they're both on by default.
+
+- Added `exec::with_deadline` and `exec::with_timeout`, more convenient methods
+  for time-limiting the execution of a future. Compared to the traditional
+  method of using `select_biased!`, these functions are significantly less
+  verbose, more obvious, and produce smaller code too. This also relieves
+  applications from depending on the `futures` crate for timeouts if they don't
+  want to.
+
+## Version 0.3.5
+
+- Fix bug in `handoff` when built without `debug_assertions` -- I introduced
+  this in 0.3.4 in my code size "improvements." This has demonstrated the need
+  to build the examples in both release and debug modes for coverage.
+
+## Version 0.3.4
+
+- Changed the lifetimes on the `reserve` operation on `spsc::Push`. The original
+  definition allowed for an unlikely but easily reachable deadlock, where code
+  could simultaneously wait for two permits from the same queue -- the second
+  permit will never arrive. I consider this a bug fix, and it won't break code
+  unless that code contains a deadlock, so I'm including this in a minor rev.
+  Currently not planning on yanking 0.3.3.
+
+- Further code size improvements.
+
+## Version 0.3.3
+
+- Fixed a bug I introduced into `yield_cpu` in 0.3.1. Please move away from
+  0.3.1/0.3.2 at your convenience. No other changes in this release.
+
+## Version 0.3.2
+
+- Added explicit cancel safety annotations to all async/future operations.
+  Currently everything except `handoff` is either strict cancel-safe or
+  deprecated! Yay.
+- Made certain implementation details cheaper on ARMv6-M.
+- Took a pass over all the rustdoc and tidied things up. There are now more
+  examples and stuff.
+
+
+## Version 0.3.1
+
+- Based on watching people learning `async`, I'm adding a new operation to
+  `lilos::spsc::Push`: `reserve`. This is similar to the old `push` but resolves
+  to a `Permit` that lets you do the push synchronously. This lets you avoid
+  losing data if cancelled, which is critical for building higher-level
+  cancel-safe abstractions. Because I'm increasingly convinced of its danger, I
+  have deprecated `lilos::spsc::Push::push`. Please use `reserve` if you need to
+  block: `q.reserve().await.push(data);`
+
+- `lilos` no longer depends on `futures`, which may reduce your build times, and
+  makes things easier to interpret in a debugger.
+
+## Version 0.3.0
+
+**`lilos` now supports the stable toolchain!**
+
+- Minimum supported Rust version now 1.69 for various fixes.
+
+- Cortex-M0 CPUs are now fully supported, with a worked example for the RP2040
+  in `examples/rp2040`, and successful applications (not in this repo) on Nordic
+  nRF52832 and STM32G0. (Note that `lilos` is not multi-CPU aware, so the second
+  core on the RP2040 can run _code_ but not `lilos` tasks. Because very few
+  `lilos` types are `Send`, it should be hard to screw this up without effort.)
+
+- All SysTick timer support is now behind a feature, `systick`, which is on by
+  default. You can omit this if you're targeting a platform where the SysTick
+  timer is stopped in the normal sleep/wait states, such as the Nordic nRF52832.
+  Your application will need to use interrupts (including potentially interrupts
+  from a replacement low-power timer) to handle all events. I'll post a worked
+  example eventually.
+
+- Upgraded to `cortex-m-rt` 0.7.1; earlier 0.6-series `cortex-m-rt` crates don't
+  reliably preserve stack alignment on startup, and must be avoided. (It would
+  be nice if Cargo had something louder than yank in this case.) This is a
+  user-visible change because you're responsible for linking in the
+  `cortex-m-rt` setup code into your `main` routine -- make sure you're not
+  using 0.6.
+
+### Example app updates
+
+- New STM32H7 UART echo example -- similar to the STM32F407 example, but on
+  hardware you can buy! (Edit: ...aaaaand it's out of stock)
+
+- Changes to ensure that RLS/rust-analyzer work in examples.
+
+### API changes
+
+- OS APIs have given up on `never_type` ever stabilizing and switched to the
+  awkwardly-named-but-stable `core::convert::Infallible` type. The main
+  implication for programs: task futures should now have the type `async fn
+  my_task(arguments) -> Infallible` instead of `-> !`. You can probably
+  search-replace this.
+
+- The `Mutex` API has changed to omit the `lock` operation by default. I've
+  decided the traditional `lock`/`MutexGuard` approach in async code makes it
+  too easy to accidentally write cancel-incorrect abstractions. You now have to
+  opt into the guard-based operations on a `Mutex`-by-`Mutex` basis by replacing
+  `Mutex<T>` with `Mutex<CancelSafe<T>>` -- but first try using the `perform`
+  operation instead.
+
+- APIs relying on `core::time::Duration` have been switched over to a new
+  `lilos::time::Millis` type, with `Duration` optionally supported where it
+  makes sense. It turns out that `Duration` is internally structured such that
+  essentially all operations require 64-bit (or 128-bit!) multiplication and/or
+  division/remainder. This became _really obvious_ on M0, which lacks any sort
+  of division insruction. Switching away from `Duration` cuts several kiB off
+  the size of the OS (which, depending on which features you're using, can be as
+  much as 50-60%).
+
+- The OS timestamp type has been renamed from `lilos::time::Ticks` to
+  `lilos::time::TickTime` because I kept feeling like "ticks" sounds like a
+  measure of time duration, rather than a timestamp. With the introduction of
+  `Millis` it started to seem really ambiguous, so, I changed it.
+
+- Two significant API changes to `PeriodicGate`:
+    - `PeriodicGate` is now created using `from` instead of `new`, which lets it
+      take either a cheap `Millis` or an expensive `Duration`. (This is the main
+      change required to port simple applications to 0.3 in my experience.)
+
+    - Added `PeriodicGate::new_shift` for setting up periodic timers out of
+      phase with respect to one another. This is useful for e.g. scheduling a
+      display refresh at 60 Hz, and scheduling serial communication to happen at
+      exactly the same frequency but shifted so they don't compete (which was
+      the motivating use case).
+
+- `Notify::until` is now more powerful and can wait for a `bool` condition (its
+  original use case), _or_ for an operation returning `Option` to return `Some`.
+  In the latter case, it returns the contained value. As a result, the old
+  `until_some` has been removed -- change any uses of it to use `until`.
+
+- All public types in the OS now have `Debug` impls for your debug-printing
+  pleasure.
+
+- `TickTime` can now be converted to and from a `u64`.
+
+- The internal `atomic` module, containing "polyfill" atomic operations for
+  portability between bigger cores and Cortex-M0, is now `pub` so applications
+  can use it if desired.
+
+### Bug fixes
+
+- `mutex` macros now import `Pin` so you don't have to (whoops!).
+
+### Internal changes
+
+- A bunch of code size optimizations for small processors.
+- Switch to Rust 2021.
+- Fix some uses of deprecated `cortex-m` API.
+- More aggressive warning settings.
+- Use `unsafe_op_in_unsafe_fn`, which should really be Rust's default.
+- The repo is no longer a workspace, because builds in workspaces with
+  `.cargo/config` files change behavior depending on which directory you're in,
+  despite having all build targets available, and this keeps confusing me.
+- Example programs and OS internals have switched to the newly stabilized
+  `core::pin::pin!` macro instead of `pin_utils`. You don't have to do this in
+  your own programs, but I recommend it!
+
+## Version 0.2.1
+
+- Add `handoff` (rendezvous) type, which can be _much_ cheaper than a full
+  `spsc` queue if you don't mind having the sender and receiver synchronize.
+
+- No longer require the `inline-asm` feature from `cortex-m`. This is a visible
+  change since it may affect your feature unification, but should not be a
+  breaking change.
+
+## Version 0.2.0
+
+- It became apparent that the original `queue` had soundness issues. Replaced
+  `queue` with `spsc`, a rewritten version that I'm more confident in. This has
+  a very different API, so this is a breaking change. `spsc` (single-producer
+  single-consumer) is intended to distinguish it from other kinds of queues in
+  the future.
+
+- Both `spsc` (formerly `queue`) and `mutex` are now behind features, so you can
+  opt into the parts of the system you need.
+
+## Version 0.1.0
+
+Initial public release of the "operating system" factored out of my LED
+controller project.
+
+0.1.1 and 0.1.2 were only docs changes.

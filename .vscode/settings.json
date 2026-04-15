@@ -2,5 +2,6 @@
     "makefile.configureOnOpen": false,
     "rust-analyzer.linkedProjects": [
         "./testcases/minimal/Cargo.toml"
-    ]
+    ],
+    "python.terminal.activateEnvironment": false
 }

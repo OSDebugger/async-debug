@@ -1,8 +1,57 @@
 #!/usr/bin/env node
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 Object.defineProperty(exports, "__esModule", { value: true });
 const child_process_1 = require("child_process");
 const miParser_1 = require("./miParser");
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
+function logToFile(message) {
+    const logFile = path.join(cwd, 'temp', 'adapter-debug.log');
+    try {
+        fs.mkdirSync(path.dirname(logFile), { recursive: true });
+        fs.appendFileSync(logFile, message + '\n', 'utf8');
+    }
+    catch { }
+}
+function normalizeTargetRemote(remote) {
+    if (remote === '127.0.0.1:1234' || remote === 'localhost:1234') {
+        return ':1234';
+    }
+    return remote;
+}
 // ---------------------------------------------------------------------------
 // Environment
 // ---------------------------------------------------------------------------
@@ -10,6 +59,10 @@ const program = process.env.ARDB_PROGRAM;
 const argsStr = process.env.ARDB_ARGS || '[]';
 const cwd = process.env.ARDB_CWD || process.cwd();
 const pythonPath = process.env.PYTHONPATH || '';
+const gdbPath = process.env.ARDB_GDB_PATH || 'gdb';
+const targetRemote = process.env.ARDB_TARGET_REMOTE || '';
+const gdbArch = process.env.ARDB_GDB_ARCH || '';
+let remoteAttached = false;
 if (!program) {
     console.error('Error: ARDB_PROGRAM environment variable not set');
     process.exit(1);
@@ -63,6 +116,44 @@ let nextVarRef = 1;
 const varRefMap = new Map();
 /** Names of GDB var-objects created during the current stop. Deleted on resume. */
 const createdVarObjects = [];
+function isLilosProgram() {
+    return !!program && program.includes('/testcases/lilos/');
+}
+function getLilosRoot() {
+    return '/home/user/RustDebug/rust-debugger-DA/testcases/lilos';
+}
+function toGdbSourceLocation(filePath, line) {
+    // 只有 lilos 才做特殊路径转换
+    if (isLilosProgram()) {
+        const lilosRoot = getLilosRoot();
+        const rel = path.relative(lilosRoot, filePath).replace(/\\/g, '/');
+        return `${rel}:${line}`;
+    }
+    // 其他例子保持原始绝对路径
+    return `${filePath}:${line}`;
+}
+function remapGdbSourcePath(gdbPath) {
+    if (!gdbPath)
+        return gdbPath;
+    const normalized = gdbPath.replace(/\\/g, '/');
+    // 非 lilos：不要做任何 lilos 专用映射
+    if (!isLilosProgram()) {
+        return normalized;
+    }
+    // lilos：如果已经是当前工作区里的路径，直接返回
+    if (normalized.startsWith('/home/user/RustDebug/rust-debugger-DA/testcases/lilos/')) {
+        return normalized;
+    }
+    // lilos：把旧的 /home/user/lilos/... 映射到当前工作区
+    if (normalized.startsWith('/home/user/lilos/')) {
+        return normalized.replace('/home/user/lilos/', '/home/user/RustDebug/rust-debugger-DA/testcases/lilos/');
+    }
+    // lilos：如果只是相对路径 testsuite/...，拼到当前 lilos 根目录
+    if (normalized.startsWith('testsuite/')) {
+        return path.join(getLilosRoot(), normalized).replace(/\\/g, '/');
+    }
+    return normalized;
+}
 // ---------------------------------------------------------------------------
 // DAP message parsing (stdin)
 // ---------------------------------------------------------------------------
@@ -169,9 +260,15 @@ function handleRequest(request) {
  * pressing Continue to actually start execution.
  */
 function handleLaunch(request) {
-    launchGDB();
-    inferiorStarted = false;
-    sendResponse(request);
+    try {
+        launchGDB();
+        inferiorStarted = false;
+        remoteAttached = false;
+        sendResponse(request);
+    }
+    catch (err) {
+        sendErrorResponse(request, err.message || String(err));
+    }
 }
 /**
  * Handle "configurationDone" request.
@@ -275,9 +372,10 @@ function handleStackTrace(request) {
                     column: 0,
                 };
                 if (node.fullname || node.file) {
+                    const mappedPath = remapGdbSourcePath(node.fullname || node.file);
                     frame.source = {
                         name: node.file || '',
-                        path: node.fullname || node.file || '',
+                        path: mappedPath || node.fullname || node.file || '',
                     };
                 }
                 if (node.addr) {
@@ -350,9 +448,10 @@ function fallbackPhysicalStackTrace(request, threadId) {
                     column: 0,
                 };
                 if (f.fullname || f.file) {
+                    const mappedPath = remapGdbSourcePath(f.fullname || f.file);
                     frame.source = {
                         name: f.file || '',
-                        path: f.fullname || f.file || '',
+                        path: mappedPath || f.fullname || f.file || '',
                     };
                 }
                 if (f.addr) {
@@ -376,30 +475,88 @@ function fallbackPhysicalStackTrace(request, threadId) {
  * First continue: execute -exec-run to start the inferior.
  * Subsequent continues: execute -exec-continue to resume.
  */
+let continueInProgress = false;
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function connectRemoteWithRetry() {
+    let lastErr;
+    for (let i = 0; i < 10; i++) {
+        try {
+            logToFile(`[Adapter] remote connect attempt ${i + 1}: ${targetRemote}`);
+            const remote = normalizeTargetRemote(targetRemote);
+            await sendMICommand(`-target-select remote ${remote}`);
+            remoteAttached = true;
+            logToFile(`[Adapter] remote connect success`);
+            return;
+        }
+        catch (err) {
+            lastErr = err;
+            logToFile(`[Adapter] remote connect failed attempt ${i + 1}: ${err.message}`);
+            await sleep(200);
+        }
+    }
+    throw lastErr || new Error('remote connect failed');
+}
 function handleContinue(request) {
+    if (continueInProgress) {
+        logToFile(`[Adapter] continue ignored: already in progress`);
+        sendResponse(request, { allThreadsContinued: true });
+        return;
+    }
+    continueInProgress = true;
+    const done = () => {
+        continueInProgress = false;
+    };
     if (!inferiorStarted) {
-        // First time: actually start the program
-        inferiorStarted = true;
         cleanupVariables()
-            .then(() => sendMICommand('-exec-run'))
-            .then(() => {
+            .then(async () => {
+            logToFile(`[Adapter] first continue: targetRemote=${targetRemote}, remoteAttached=${remoteAttached}`);
+            if (targetRemote) {
+                if (!remoteAttached) {
+                    await connectRemoteWithRetry();
+                }
+                logToFile(`[Adapter] remote session, sending console continue`);
+                return sendMICommand(`-interpreter-exec console "continue"`);
+            }
+            else {
+                logToFile(`[Adapter] local session, sending -exec-run`);
+                return sendMICommand('-exec-run');
+            }
+        })
+            .then((record) => {
+            logToFile(`[Adapter] first continue success: ${JSON.stringify(record.data)}`);
+            inferiorStarted = true;
             sendResponse(request, { allThreadsContinued: true });
+            done();
         })
             .catch((err) => {
-            process.stderr.write(`[Adapter] -exec-run failed: ${err.message}\n`);
+            logToFile(`[Adapter] first continue failed: ${err.message}`);
             sendErrorResponse(request, err.message);
+            done();
         });
     }
     else {
-        // Program already running, just resume
         cleanupVariables()
-            .then(() => sendMICommand('-exec-continue'))
             .then(() => {
+            if (targetRemote) {
+                logToFile(`[Adapter] subsequent continue: remote console continue`);
+                return sendMICommand(`-interpreter-exec console "continue"`);
+            }
+            else {
+                logToFile(`[Adapter] subsequent continue: -exec-continue`);
+                return sendMICommand('-exec-continue');
+            }
+        })
+            .then((record) => {
+            logToFile(`[Adapter] subsequent continue success: ${JSON.stringify(record.data)}`);
             sendResponse(request, { allThreadsContinued: true });
+            done();
         })
             .catch((err) => {
-            process.stderr.write(`[Adapter] -exec-continue failed: ${err.message}\n`);
+            logToFile(`[Adapter] subsequent continue failed: ${err.message}`);
             sendErrorResponse(request, err.message);
+            done();
         });
     }
 }
@@ -507,13 +664,17 @@ async function handleSetBreakpoints(request) {
         const newNumbers = [];
         const dapBreakpoints = [];
         for (const bp of requestedLines) {
-            const location = `${filePath}:${bp.line}`;
+            const location = toGdbSourceLocation(filePath, bp.line);
+            logToFile(`[Adapter] try source bp: ${location}`);
             try {
                 const record = await sendMICommand(`-break-insert -f ${location}`);
                 const bkpt = record.data?.bkpt;
+                logToFile(`[Adapter] source bp raw record: ${JSON.stringify(record.data)}`);
+                logToFile(`[Adapter] source bp bkpt: ${JSON.stringify(bkpt)}`);
                 const gdbNumber = parseInt(bkpt?.number || '0', 10);
                 const actualLine = parseInt(bkpt?.line || `${bp.line}`, 10);
                 const verified = bkpt?.pending === undefined; // pending means not yet resolved
+                logToFile(`[Adapter] source bp verified=${verified}, gdbNumber=${gdbNumber}, actualLine=${actualLine}`);
                 // Set condition if provided
                 if (bp.condition && gdbNumber > 0) {
                     await sendMICommand(`-break-condition ${gdbNumber} ${bp.condition}`).catch(() => { });
@@ -529,7 +690,7 @@ async function handleSetBreakpoints(request) {
                 });
             }
             catch (err) {
-                // Breakpoint insertion failed — report as unverified
+                logToFile(`[Adapter] source breakpoint failed: file=${filePath}, line=${bp.line}, err=${err.message}`);
                 const dapId = nextDapBreakpointId++;
                 dapBreakpoints.push({
                     id: dapId,
@@ -541,6 +702,7 @@ async function handleSetBreakpoints(request) {
             }
         }
         fileBreakpoints.set(filePath, newNumbers);
+        logToFile(`[Adapter] source dapBreakpoints: ${JSON.stringify(dapBreakpoints)}`);
         sendResponse(request, { breakpoints: dapBreakpoints });
     }
     catch (err) {
@@ -564,26 +726,32 @@ async function handleSetFunctionBreakpoints(request) {
         // 2. Insert new function breakpoints
         const dapBreakpoints = [];
         for (const fbp of requestedFunctions) {
+            logToFile(`[Adapter] try function bp: ${fbp.name}`);
             try {
                 const record = await sendMICommand(`-break-insert -f ${fbp.name}`);
                 const bkpt = record.data?.bkpt;
+                logToFile(`[Adapter] function bp raw record: ${JSON.stringify(record.data)}`);
+                logToFile(`[Adapter] function bp bkpt: ${JSON.stringify(bkpt)}`);
                 const gdbNumber = parseInt(bkpt?.number || '0', 10);
                 const actualLine = parseInt(bkpt?.line || '0', 10);
                 const verified = bkpt?.pending === undefined;
+                logToFile(`[Adapter] function bp verified=${verified}, gdbNumber=${gdbNumber}, actualLine=${actualLine}`);
                 if (fbp.condition && gdbNumber > 0) {
                     await sendMICommand(`-break-condition ${gdbNumber} ${fbp.condition}`).catch(() => { });
                 }
                 const dapId = nextDapBreakpointId++;
                 functionBreakpointNumbers.push(gdbNumber);
                 gdbBkptToDap.set(gdbNumber, { id: dapId, line: actualLine, verified });
+                const mappedFullname = remapGdbSourcePath(bkpt?.fullname);
                 dapBreakpoints.push({
                     id: dapId,
                     verified,
                     line: actualLine,
-                    source: bkpt?.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+                    source: mappedFullname ? { path: mappedFullname, name: bkpt.file || '' } : undefined,
                 });
             }
             catch (err) {
+                logToFile(`[Adapter] function breakpoint failed: name=${fbp.name}, err=${err.message}`);
                 const dapId = nextDapBreakpointId++;
                 dapBreakpoints.push({
                     id: dapId,
@@ -592,6 +760,7 @@ async function handleSetFunctionBreakpoints(request) {
                 });
             }
         }
+        logToFile(`[Adapter] function dapBreakpoints: ${JSON.stringify(dapBreakpoints)}`);
         sendResponse(request, { breakpoints: dapBreakpoints });
     }
     catch (err) {
@@ -1068,13 +1237,14 @@ function handleNotifyAsync(record) {
         const actualLine = parseInt(bkpt.line || `${entry.line}`, 10);
         entry.verified = nowVerified;
         entry.line = actualLine;
+        const mappedFullname = remapGdbSourcePath(bkpt.fullname);
         sendEvent('breakpoint', {
             reason: 'changed',
             breakpoint: {
                 id: entry.id,
                 verified: nowVerified,
                 line: actualLine,
-                source: bkpt.fullname ? { path: bkpt.fullname, name: bkpt.file || '' } : undefined,
+                source: mappedFullname ? { path: mappedFullname, name: bkpt.file || '' } : undefined,
             },
         });
     }
@@ -1086,13 +1256,17 @@ function launchGDB() {
     const args = JSON.parse(argsStr);
     const gdbArgs = [
         '--interpreter=mi2',
-        '-ex', `python import sys; sys.path.insert(0, '${pythonPath}'); import async_rust_debugger`,
         '-ex', 'set pagination off',
-        program,
-        ...args,
     ];
-    gdbProcess = (0, child_process_1.spawn)('gdb', gdbArgs, { cwd });
-    // Route GDB stdout through the MI2 parser
+    if (gdbArch) {
+        gdbArgs.push('-ex', `set architecture ${gdbArch}`);
+    }
+    if (program) {
+        gdbArgs.push(program);
+    }
+    gdbArgs.push('-ex', `python import sys; sys.path.insert(0, '${pythonPath}'); import async_rust_debugger`);
+    gdbArgs.push(...args);
+    gdbProcess = (0, child_process_1.spawn)(gdbPath, gdbArgs, { cwd });
     gdbProcess.stdout?.on('data', (data) => {
         handleGDBOutput(data);
     });

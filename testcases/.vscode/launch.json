@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+  {
+  "name": "Debug Rust (tick)",
+  "type": "ardb",
+  "request": "launch",
+  "program": "${workspaceFolder}/target/debug/tick",
+  "cwd": "${workspaceFolder}"
+  },
+  {
+  "name": "Debug Rust (tick_cancel)",
+  "type": "ardb",
+  "request": "launch",
+  "program": "${workspaceFolder}/target/debug/tick_cancel",
+  "cwd": "${workspaceFolder}"
+  }
+
+  ]
+}

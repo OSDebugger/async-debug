@@ -1,0 +1,25 @@
+[package]
+name = "lilos-testsuite-stm32f4"
+authors = ["Cliff L. Biffle <code@cliffle.com>"]
+version = "0.1.0"
+description = "Operating system tests for STM32F407."
+publish = false
+
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[package.metadata.docs.rs]
+default-target = "thumbv7em-none-eabihf"
+
+[dependencies]
+cortex-m.workspace = true
+cortex-m-rt.workspace = true
+panic-semihosting.workspace = true
+lilos-testsuite.workspace = true
+
+[[bin]]
+name = "lilos-testsuite-stm32f4"
+test = false
+bench = false

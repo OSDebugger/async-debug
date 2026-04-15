@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Rust (ARD) - lilos lm3s6965",
+      "type": "ardb",
+      "request": "attach",
+      "cwd": "/home/user/newrustdebug/rust-debugger-DA/testcases/lilos/testsuite/lm3s6965",
+      "gdbpath": "gdb-multiarch",
+      "target": ":1234",
+      "executable": "/home/user/newrustdebug/rust-debugger-DA/testcases/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965",
+      "qemuPath": "qemu-system-arm",
+      "qemuArgs": [
+        "-cpu", "cortex-m3",
+        "-machine", "lm3s6965evb",
+        "-nographic",
+        "-semihosting-config", "enable=on,target=native",
+        "-s",
+        "-S",
+        "-kernel", "/home/user/newrustdebug/rust-debugger-DA/testcases/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965"
+      ],
+      "autorun": [],
+      "stopAtConnect": true
+    }
+  ]
+}

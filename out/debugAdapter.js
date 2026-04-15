@@ -34,7 +34,7 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ARDDebugAdapterFactory = void 0;
-// src/debugAdapter.ts
+//src/debugAdapter.ts
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const gdbDebugSession_1 = require("./gdbDebugSession");
@@ -50,15 +50,22 @@ class ARDDebugAdapterFactory {
         const pythonPath = extensionPath;
         const tempDir = path.join(workspaceFolder, 'temp');
         const adapterScript = path.join(extensionPath, 'out', 'gdbAdapter.js');
+        const gdbPath = config.gdbPath || 'gdb';
+        const targetRemote = config.targetRemote || '';
+        const gdbArch = config.gdbArch || '';
+        const adapterCwd = config.cwd || workspaceFolder;
         return new vscode.DebugAdapterExecutable('node', [adapterScript], {
-            cwd: config.cwd || workspaceFolder,
+            cwd: adapterCwd,
             env: {
                 ...process.env,
                 ARDB_PROGRAM: config.program,
                 ARDB_ARGS: JSON.stringify(config.args || []),
-                ARDB_CWD: workspaceFolder,
+                ARDB_CWD: adapterCwd,
                 PYTHONPATH: pythonPath,
-                ASYNC_RUST_DEBUGGER_TEMP_DIR: tempDir
+                ASYNC_RUST_DEBUGGER_TEMP_DIR: tempDir,
+                ARDB_GDB_PATH: gdbPath,
+                ARDB_TARGET_REMOTE: targetRemote,
+                ARDB_GDB_ARCH: gdbArch,
             }
         });
     }

@@ -1,0 +1,39 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build lilos lm3s6965",
+      "type": "shell",
+      "command": "cargo build",
+      "options": {
+        "cwd": "/home/user/RustDebug/rust-debugger-DA/testcases/lilos/testsuite/lm3s6965"
+      },
+      "problemMatcher": [
+        "$rustc"
+      ],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    },
+    {
+      "label": "run qemu lilos lm3s6965",
+      "type": "shell",
+      "command": "qemu-system-arm -cpu cortex-m3 -machine lm3s6965evb -nographic -semihosting-config enable=on,target=native -s -S -kernel /home/user/RustDebug/rust-debugger-DA/testcases/lilos/target/thumbv7m-none-eabi/debug/lilos-testsuite-lm3s6965",
+      "options": {
+        "cwd": "/home/user/RustDebug/rust-debugger-DA/testcases/lilos/testsuite/lm3s6965"
+      },
+      "dependsOn": "cargo build lilos lm3s6965",
+      "isBackground": true,
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "new"
+      }
+    }
+  ]
+}
