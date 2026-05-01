@@ -123,6 +123,9 @@ export class BreakpointGroups {
 	protected currentBreakpointGroupName: string;
 	protected nextBreakpointGroup: string;
 	protected readonly session: IBreakpointGroupsSession;
+	// Tracks symbol files already loaded into GDB via add-symbol-file.
+	// We never unload them so that breakpoints from all groups stay active simultaneously.
+	private loadedSymbolFiles: Set<string> = new Set();
 
 	constructor(currentBreakpointGroupName: string, session: IBreakpointGroupsSession, nextBreakpointGroup: string) {
 		this.session = session;

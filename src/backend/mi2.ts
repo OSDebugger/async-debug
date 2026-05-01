@@ -281,6 +281,7 @@ export class MI2 extends EventEmitter {
 			if (couldBeOutput(line)) {
 				if (!gdbMatch.exec(line)) this.log("stdout", line);
 			} else {
+				console.log(`[<- GDB] ${line}`);
 				const parsed = parseMI(line);
 				let handled = false;
 				if (parsed.token !== undefined) {
@@ -785,6 +786,7 @@ export class MI2 extends EventEmitter {
 				} else resolve(node);
 			};
 			this.sendRaw(sel + "-" + command);
+			console.log(`[GDB ->] ${sel}-${command}`);
 		});
 	}
 
