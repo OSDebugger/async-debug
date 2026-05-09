@@ -28,7 +28,7 @@ import json
 # User-facing knobs
 # -------------------------
 
-MAX_CALLSITES_PER_FN = 200
+MAX_CALLSITES_PER_FN = 1000
 
 # True => 打印所有内部 future / poll 的实时输出（更完整，但更吵）
 PRINT_INTERNAL_POLL_HITS = True
@@ -55,6 +55,10 @@ _CO_BY_KEY = {}        # (poll_sym, this_ptr) -> coro_id
 _CO_META = {}          # coro_id -> (poll_sym, this_ptr)
 _CO_POLL_SEQ = {}      # coro_id -> poll_count
 _TLS_STACK = {}        # thread_num -> [coro_id, ...]
+# parent poll symbol -> last observed direct child poll hit
+_LAST_CHILD_HIT_BY_PARENT = {}
+_LAST_CHILD_HIT_BY_CALLER_FRAME = {}
+_LAST_CHILD_HIT_BY_FUNC_ADDR = {}
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
@@ -160,7 +164,7 @@ _EVENTS_INSTALLED = False
 # Low-level helpers
 # -------------------------
 
-CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
+CALL_MNEMONIC_RE = re.compile(r"^\s*(call\w*|bl|blx)\b", re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
 def _ptr_size() -> int:
@@ -182,6 +186,22 @@ def _read_ptr(addr: int) -> int:
 
 def _reg_u64(name: str) -> int:
     return int(gdb.parse_and_eval(f"${name}"))
+
+def _first_arg_reg() -> str:
+    """
+    Return the architecture-appropriate register name for the first argument.
+    x86_64 SysV -> rdi
+    ARM/Thumb (AAPCS) -> r0
+    """
+    try:
+        arch_name = gdb.selected_frame().architecture().name().lower()
+    except Exception:
+        arch_name = ""
+
+    if "arm" in arch_name or "thumb" in arch_name:
+        return "r0"
+
+    return "rdi"
 
 def _current_pc() -> int:
     return int(gdb.parse_and_eval("$pc"))
@@ -259,6 +279,7 @@ def _collect_call_sites() -> list[int]:
     for ins in insns:
         asm = ins.get("asm", "").strip()
         if CALL_MNEMONIC_RE.match(asm):
+            _log_ard(f"[ARD] call-detect insn: {asm}")
             a = int(ins["addr"])
             if a not in seen:
                 out.append(a)
@@ -277,7 +298,14 @@ def _current_asm() -> str:
 
 def _resolve_call_target_from_asm(asm: str) -> int | None:
     s = asm.strip()
-
+    # ARM/Thumb: bl/blx immediate
+    m = re.search(r"\bblx?\s+0x([0-9a-fA-F]+)", s)
+    if m:
+        try:
+            return int(m.group(1), 16)
+        except Exception:
+            return None
+        
     # direct call (has immediate 0xADDR)
     if "call" in s and "0x" in s and "*0x" not in s:
         m = HEX_ADDR_RE.search(s)
@@ -314,11 +342,25 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
 # -------------------------
 
 def _pollsym_to_envtype(poll_sym: str) -> str | None:
-    s = poll_sym
-    s = s.replace("{async_fn#", "{async_fn_env#")
-    s = s.replace("{async_block#", "{async_block_env#")
-    return s if s != poll_sym else None
+    """
+    Map a poll symbol to the concrete async env type name.
 
+    Important rule:
+    - If the symbol names an async block poll like
+      foo::{async_fn#0}::{async_block#0},
+      the env type is foo::{async_fn#0}::{async_block_env#0}
+      (only replace the async_block part).
+    - Otherwise, for a plain async function poll like
+      foo::{async_fn#0},
+      the env type is foo::{async_fn_env#0}.
+    """
+    if "{async_block#" in poll_sym:
+        return poll_sym.replace("{async_block#", "{async_block_env#")
+
+    if "{async_fn#" in poll_sym:
+        return poll_sym.replace("{async_fn#", "{async_fn_env#")
+
+    return None
 
 def _read_env_state(poll_sym: str, this_ptr: int):
     """
@@ -366,6 +408,125 @@ def _read_env_state(poll_sym: str, this_ptr: int):
 
     return "N/A"
 
+def _read_env_state_from_value(env_val):
+    """
+    Read the state discriminant directly from a GDB value that already
+    represents an async env object.
+
+    Returns:
+      - int state discriminant if readable
+      - "N/A" otherwise
+    """
+    try:
+        return int(env_val["__state"])
+    except Exception:
+        pass
+
+    try:
+        env_t = env_val.type.strip_typedefs()
+        fields = env_t.fields()
+        if fields:
+            first_val = env_val[fields[0].name]
+            first_code = first_val.type.strip_typedefs().code
+            if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL, gdb.TYPE_CODE_ENUM):
+                return int(first_val)
+    except Exception:
+        pass
+
+    return "N/A"
+
+def _try_read_env_value_from_frame(frame: gdb.Frame, poll_sym: str):
+    """
+    Best-effort: for inlined async frames, try to read the hidden __awaitee
+    variable from the current block or its superblock.
+
+    Returns:
+      - a gdb.Value representing the async env object
+      - None if unavailable
+    """
+    try:
+        block = frame.block()
+    except Exception:
+        return None
+
+    candidates = []
+    b = block
+    steps = 0
+    while b is not None and steps < 3:
+        candidates.append(b)
+        b = b.superblock
+        steps += 1
+
+    for b in candidates:
+        try:
+            v = frame.read_var("__awaitee", b)
+        except Exception:
+            continue
+
+        try:
+            ty_name = str(v.type.strip_typedefs())
+        except Exception:
+            ty_name = str(v.type)
+
+        # Prefer an env object that matches the target poll symbol's env type
+        env_type_name = _pollsym_to_envtype(poll_sym)
+        if env_type_name and env_type_name in ty_name:
+            return v
+
+        # Also accept direct async env-looking types
+        if "{async_fn_env#" in ty_name or "{async_block_env#" in ty_name:
+            return v
+
+    return None
+
+def _try_read_local_awaitee_value(frame: gdb.Frame):
+    """
+    Read the current block's __awaitee, which usually represents the
+    inner future being awaited by the current async frame.
+    """
+    try:
+        block = frame.block()
+    except Exception:
+        return None
+
+    try:
+        return frame.read_var("__awaitee", block)
+    except Exception:
+        return None
+
+
+def _value_type_name(val) -> str:
+    try:
+        return str(val.type.strip_typedefs())
+    except Exception:
+        try:
+            return str(val.type)
+        except Exception:
+            return "UNKNOWN"
+
+
+def _value_state_name(val):
+    """
+    Best-effort semantic state extraction from a GDB value string.
+    Examples:
+      Type::Unresumed -> Unresumed
+      YieldCpu {polled: <optimized out>} -> YieldCpu
+    """
+    try:
+        s = str(val).strip()
+        if not s:
+            return "N/A"
+
+        if "{" in s:
+            return s.split("{", 1)[0].strip()
+
+        if "::" in s:
+            return s.split("::")[-1].strip()
+
+        return s
+    except Exception:
+        return "N/A"
+    
 def _try_read_awaitee_from_current_poll(poll_sym: str):
     env_type_name = _pollsym_to_envtype(poll_sym)
     if not env_type_name:
@@ -378,7 +539,7 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
 
     # x86_64 SysV: rdi = env ptr
     try:
-        env_ptr = _reg_u64("rdi")
+        env_ptr = _reg_u64(_first_arg_reg())
     except Exception:
         return None
 
@@ -406,12 +567,183 @@ def _try_read_awaitee_from_current_poll(poll_sym: str):
         return (str(awaitee.type), str(awaitee))
     except gdb.error:
         return None
+def _extract_angle_inner_types(s: str) -> list[str]:
+    out = []
+    depth = 0
+    cur = []
+    for ch in s:
+        if ch == '<':
+            depth += 1
+            if depth == 1:
+                cur = []
+                continue
+        elif ch == '>':
+            if depth == 1:
+                inner = ''.join(cur).strip()
+                if inner:
+                    parts = [p.strip() for p in inner.split(',') if p.strip()]
+                    out.extend(parts)
+                cur = []
+            depth = max(0, depth - 1)
+            continue
 
-def _child_poll_symbol_from_awaitee_type(awa_ty: str) -> str | None:
-    if "{async_fn_env#" in awa_ty:
-        return awa_ty.replace("{async_fn_env#", "{async_fn#")
-    if "{async_block_env#" in awa_ty:
-        return awa_ty.replace("{async_block_env#", "{async_block#")
+        if depth >= 1:
+            cur.append(ch)
+    return out
+
+def _symbol_query_tokens(ty: str) -> list[str]:
+    ty = (ty or "").strip()
+    if not ty:
+        return []
+
+    toks = [ty]
+
+    base = ty.split("::")[-1].strip()
+    if base and base not in toks:
+        toks.append(base)
+
+    for part in re.split(r"::|<|>|,|\s+", ty):
+        part = part.strip()
+        if len(part) >= 4 and part not in toks:
+            toks.append(part)
+
+    return toks
+
+def _future_type_to_poll_symbol(future_ty: str) -> str | None:
+    """
+    Best-effort mapping:
+      lilos::exec::YieldCpu
+        -> <lilos::exec::YieldCpu as core::future::future::Future>::poll
+
+    Strategy:
+      1) Query by full type name, base name, and split tokens
+      2) Accept lines containing both Future and poll
+      3) Prefer exact matches containing the full future type
+    """
+    future_ty = (future_ty or "").strip()
+    if not future_ty:
+        return None
+
+    tokens = _symbol_query_tokens(future_ty)
+    base = future_ty.split("::")[-1].strip()
+
+    all_matches = []
+
+    for q in tokens:
+        try:
+            txt = gdb.execute(f"info functions {q}", to_string=True)
+        except Exception:
+            continue
+
+        for line in txt.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if "Future" not in s or "poll" not in s:
+                continue
+
+            score = 0
+            if future_ty in s:
+                score += 100
+            if f"<{future_ty} as " in s:
+                score += 100
+            if base and base in s:
+                score += 20
+            if "::poll" in s:
+                score += 20
+
+            all_matches.append((score, s))
+
+    if not all_matches:
+        _log_ard(f"[ARD] future->poll miss: {future_ty}")
+        return None
+
+    all_matches.sort(key=lambda x: x[0], reverse=True)
+    best = all_matches[0][1]
+    _log_ard(f"[ARD] future->poll hit: {future_ty} -> {best}")
+    return best
+def _base_type_name(ty: str) -> str:
+    ty = (ty or "").strip()
+    if not ty:
+        return ""
+    return ty.split("::")[-1].strip()
+
+
+def _infer_child_poll_from_current_frame(awaitee_ty: str) -> str | None:
+    """
+    Infer the awaited child's poll symbol by scanning the current frame's
+    callsites and looking for a poll callee whose symbol mentions the awaitee type.
+    This is more reliable than `info functions <type>` for Rust demangled names.
+    """
+    awaitee_ty = (awaitee_ty or "").strip()
+    if not awaitee_ty:
+        return None
+
+    base = _base_type_name(awaitee_ty)
+
+    try:
+        r = _function_range()
+        if r is None:
+            return None
+        start, end = r
+        arch = gdb.selected_frame().architecture()
+        insns = arch.disassemble(start, end)
+    except Exception:
+        return None
+
+    candidates = []
+
+    for ins in insns:
+        asm = ins.get("asm", "").strip()
+        if not CALL_MNEMONIC_RE.match(asm):
+            continue
+
+        target = _resolve_call_target_from_asm(asm)
+        if not target:
+            continue
+
+        for callee in _callee_candidates(target):
+            if "poll" not in callee or "Future" not in callee:
+                continue
+
+            score = 0
+            if awaitee_ty in callee:
+                score += 100
+            if base and base in callee:
+                score += 40
+            if "::poll" in callee:
+                score += 20
+
+            candidates.append((score, callee))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return candidates[0][1]
+
+def _child_poll_symbol_from_awaitee_type(awaitee_ty: str) -> str | None:
+    awaitee_ty = (awaitee_ty or "").strip()
+    if not awaitee_ty:
+        return None
+
+    if "{async_fn_env#" in awaitee_ty:
+        return awaitee_ty.replace("{async_fn_env#", "{async_fn#")
+
+    if "{async_block_env#" in awaitee_ty:
+        return awaitee_ty.replace("{async_block_env#", "{async_block#")
+
+    # Prefer direct inference from current frame's callsites
+    poll_sym = _infer_child_poll_from_current_frame(awaitee_ty)
+    if poll_sym:
+        _log_ard(f"[ARD] future->poll via-callsites: {awaitee_ty} -> {poll_sym}")
+        return poll_sym
+
+    # Fallback to the old info-functions strategy
+    poll_sym = _future_type_to_poll_symbol(awaitee_ty)
+    if poll_sym:
+        return poll_sym
+
     return None
 
 
@@ -610,6 +942,30 @@ def _load_async_symbol_set_from_grouped():
     except Exception:
         pass
 
+def _has_existing_real_async_child(snapshot_path, phys_tail, leaf_func: str) -> bool:
+    """
+    Check whether a real async child with the same function already exists
+    either in the shadow-stack-derived snapshot path or in the physical tail.
+    """
+    try:
+        for node in snapshot_path:
+            if node.get("type") != "async":
+                continue
+            if node.get("cid") is None:
+                continue
+            if node.get("func") == leaf_func:
+                return True
+
+        for node in reversed(phys_tail):
+            if node.get("type") != "async":
+                continue
+            if node.get("cid") is None:
+                continue
+            if node.get("func") == leaf_func:
+                return True
+    except Exception:
+        pass
+    return False
 
 def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
     """
@@ -731,6 +1087,9 @@ def _cleanup_run_scoped():
     _CO_BY_KEY.clear()
     _CO_META.clear()
     _CO_POLL_SEQ.clear()
+    _LAST_CHILD_HIT_BY_PARENT.clear()
+    _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
+    _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
 
@@ -762,7 +1121,9 @@ class PollEntryBP(gdb.Breakpoint):
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
         try:
-            this_ptr = _reg_u64("rdi")   # x86_64 SysV: first arg (env ptr)
+            this_ptr = _reg_u64(_first_arg_reg())
+            if this_ptr <= 0x10000:
+                this_ptr = 0
         except Exception:
             this_ptr = 0
 
@@ -783,6 +1144,59 @@ class PollEntryBP(gdb.Breakpoint):
         if cid:
             seq = _CO_POLL_SEQ.get(cid, 0) + 1
             _CO_POLL_SEQ[cid] = seq
+        if cid and this_ptr:
+            addr_hex = hex(this_ptr)
+            _LAST_CHILD_HIT_BY_FUNC_ADDR[(poll_sym, addr_hex)] = {
+                "func": poll_sym,
+                "cid": cid,
+                "poll": seq,
+                "addr": addr_hex,
+                "state": _read_env_state(poll_sym, this_ptr),
+            }
+        # Record the latest direct child poll hit for the current parent.
+        try:
+            st = _TLS_STACK.get(tid, [])
+            if cid and len(st) >= 2:
+                parent_cid = st[-2]
+                parent_sym, _parent_ptr = _CO_META.get(parent_cid, ("", 0))
+                if parent_sym:
+                    _LAST_CHILD_HIT_BY_PARENT[parent_sym] = {
+                        "func": poll_sym,
+                        "cid": cid,
+                        "poll": seq,
+                        "addr": hex(this_ptr) if this_ptr else "",
+                        "state": _read_env_state(poll_sym, this_ptr) if this_ptr else "N/A",
+                    }
+                    _log_ard(
+                        f"[ARD] child-hit parent={parent_sym} child={poll_sym} cid={cid} poll={seq} addr={hex(this_ptr) if this_ptr else '0x0'}"
+                    )
+        except Exception:
+            pass
+                # Also record the most relevant async caller frame name from the physical stack.
+        try:
+            caller_frame = gdb.selected_frame().older()
+            caller_async_name = ""
+
+            while caller_frame:
+                caller_name = caller_frame.name() or ""
+                if caller_name and caller_name != poll_sym and _is_async_symbol(caller_name):
+                    caller_async_name = caller_name
+                    break
+                caller_frame = caller_frame.older()
+
+            if cid and caller_async_name:
+                _LAST_CHILD_HIT_BY_CALLER_FRAME[caller_async_name] = {
+                    "func": poll_sym,
+                    "cid": cid,
+                    "poll": seq,
+                    "addr": hex(this_ptr) if this_ptr else "",
+                    "state": _read_env_state(poll_sym, this_ptr) if this_ptr else "N/A",
+                }
+                _log_ard(
+                    f"[ARD] caller-frame-hit caller={caller_async_name} child={poll_sym} cid={cid} poll={seq} addr={hex(this_ptr) if this_ptr else '0x0'}"
+                )
+        except Exception:
+            pass
 
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
@@ -912,6 +1326,9 @@ class ARDResetCommand(gdb.Command):
         _CO_BY_KEY.clear()
         _CO_META.clear()
         _CO_POLL_SEQ.clear()
+        _LAST_CHILD_HIT_BY_PARENT.clear()
+        _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
+        _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
@@ -1019,6 +1436,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                 "addr": hex(this_ptr),
                 "poll": seq,
                 "state": state_val,
+                "origin": "trace",
                 "file": async_file,
                 "fullname": async_fullname,
                 "line": async_line
@@ -1079,43 +1497,48 @@ class ARDGetSnapshotCommand(gdb.Command):
                         # $rdi is unreliable for non-entry frames.
                         node_state = "N/A"
                         this_ptr = 0
+                        env_val = None
+
                         try:
                             frame.select()
                             block = frame.block()
                             for sym in block:
                                 if sym.is_argument:
                                     val = frame.read_var(sym)
-                                    # The first arg is typically Pin<&mut Self>.
-                                    # Pin { __pointer: &mut T } — we need the
-                                    # raw pointer inside.  Try to drill through
-                                    # Pin and reference layers.
                                     this_ptr = _extract_raw_ptr(val)
-                                    break
+                                    if this_ptr:
+                                        break
                         except Exception:
                             pass
-                        # Fallback to $rdi if debug info failed
+
+                        # Fallback to register-based first arg
                         if not this_ptr:
                             try:
                                 frame.select()
-                                this_ptr = _reg_u64("rdi")
+                                reg_ptr = _reg_u64(_first_arg_reg())
+                                if reg_ptr > 0x10000:
+                                    this_ptr = reg_ptr
+                            except Exception:
+                                pass
+
+                        # Additional fallback for inlined async frames:
+                        # try to read the hidden __awaitee env object directly
+                        if not this_ptr:
+                            try:
+                                frame.select()
+                                env_val = _try_read_env_value_from_frame(frame, fname)
+                                if env_val is not None:
+                                    node_state = _read_env_state_from_value(env_val)
                             except Exception:
                                 pass
 
                         if this_ptr:
                             try:
-                                # First try exact match
                                 cid_phys, is_new = _get_or_make_coro_id(fname, this_ptr)
 
-                                # If we just created a new CID, check if there's
-                                # an existing CID with a nearby address for the
-                                # same function.  Pin wrapping can shift the
-                                # pointer by a small offset, so we merge to
-                                # prevent identity fragmentation.
                                 if is_new:
                                     nearby = _find_nearby_coro(fname, this_ptr)
                                     if nearby is not None and nearby != cid_phys:
-                                        # Merge: discard the newly created CID,
-                                        # reuse the nearby one
                                         key_new = (fname, int(this_ptr))
                                         _CO_BY_KEY.pop(key_new, None)
                                         _CO_META.pop(cid_phys, None)
@@ -1130,6 +1553,92 @@ class ARDGetSnapshotCommand(gdb.Command):
                             except Exception:
                                 pass
 
+                    # Try to expand the currently awaited inner future as an extra leaf node.
+                    try:
+                        frame.select()
+                        local_awaitee = _try_read_local_awaitee_value(frame)
+                    except Exception:
+                        local_awaitee = None
+
+                    if local_awaitee is not None:
+                        try:
+                            awaitee_type = _value_type_name(local_awaitee)
+                            outer_env_type = _pollsym_to_envtype(fname) or ""
+
+                            if awaitee_type and awaitee_type != outer_env_type:
+                                awaitee_state = _value_state_name(local_awaitee)
+                                awaitee_poll_sym = _child_poll_symbol_from_awaitee_type(awaitee_type)
+                                leaf_func = awaitee_poll_sym or awaitee_type
+
+                                leaf_cid = None
+                                leaf_poll = 0
+                                leaf_addr = f"{node_addr}::awaitee::{leaf_func}"
+                                leaf_state = awaitee_state
+                                leaf_origin = "inferred"
+
+                                observed = (
+                                    _LAST_CHILD_HIT_BY_CALLER_FRAME.get(fname)
+                                    or _LAST_CHILD_HIT_BY_PARENT.get(fname)
+                                )
+                                if observed and observed.get("func") == leaf_func:
+                                    leaf_cid = observed.get("cid")
+                                    leaf_poll = observed.get("poll", 0)
+                                    leaf_addr = observed.get("addr") or leaf_addr
+                                    leaf_state = observed.get("state") or leaf_state
+                                    leaf_origin = "trace-upgraded"
+                                    _log_ard(
+                                        f"[ARD] snapshot-upgrade parent={fname} child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
+                                    )
+                                else:
+                                    observed_by_key = _LAST_CHILD_HIT_BY_FUNC_ADDR.get((leaf_func, node_addr))
+                                    if observed_by_key:
+                                        leaf_cid = observed_by_key.get("cid")
+                                        leaf_poll = observed_by_key.get("poll", 0)
+                                        leaf_addr = observed_by_key.get("addr") or leaf_addr
+                                        leaf_state = observed_by_key.get("state") or leaf_state
+                                        leaf_origin = "trace-upgraded"
+                                        _log_ard(
+                                            f"[ARD] snapshot-upgrade-by-child-key child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
+                                        )
+                                    elif "MaybeDone" in leaf_func:
+                                        _log_ard(
+                                            f"[ARD] snapshot-upgrade-by-child-key miss child={leaf_func} node_addr={node_addr}"
+                                        )
+
+                                # If the next real async frame is already this same child poll,
+                                # do not also append an inferred awaitee leaf.
+                                if _has_existing_real_async_child(snapshot["path"], phys_tail, leaf_func):
+                                    _log_ard(
+                                        f"[ARD] awaitee-skip-duplicate parent={fname} child={leaf_func}"
+                                    )
+                                else:
+                                    _log_ard(
+                                        f"[ARD] awaitee-phys {fname} -> type={awaitee_type} poll={awaitee_poll_sym} state={awaitee_state}"
+                                    )
+
+                                    phys_tail.append({
+                                        "type": "async",
+                                        "cid": leaf_cid,
+                                        "func": leaf_func,
+                                        "addr": leaf_addr,
+                                        "poll": leaf_poll,
+                                        "state": leaf_state,
+                                        "origin": leaf_origin,
+                                        "file": phys_file,
+                                        "fullname": phys_fullname,
+                                        "line": phys_line
+                                    })
+                        except Exception:
+                            pass
+
+                    if node_cid is not None and node_poll == 0:
+                        filled_poll = _CO_POLL_SEQ.get(node_cid, node_poll)
+                        if filled_poll != 0:
+                            node_poll = filled_poll
+                            _log_ard(
+                                f"[ARD] snapshot-fill-poll cid={node_cid} poll={node_poll} func={fname}"
+                            )
+
                     phys_tail.append({
                         "type": frame_type,
                         "cid": node_cid,
@@ -1137,6 +1646,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                         "addr": node_addr,
                         "poll": node_poll,
                         "state": node_state,
+                        "origin": "physical",
                         "file": phys_file,
                         "fullname": phys_fullname,
                         "line": phys_line

@@ -35,6 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.AsyncInspectorPanel = void 0;
 const vscode = __importStar(require("vscode"));
+const path = __importStar(require("path"));
+const fs = __importStar(require("fs"));
 /**
  * Async Inspector Panel - Webview for displaying async execution trees
  */
@@ -65,7 +67,7 @@ class AsyncInspectorPanel {
                     await this.handleSnapshot();
                     break;
                 case 'selectNode':
-                    await this.handleSelectNode(message.cid);
+                    await this.handleSelectNode(message);
                     break;
                 case 'locate':
                     await this.handleLocate(message.symbol);
@@ -160,51 +162,87 @@ class AsyncInspectorPanel {
             });
         }
     }
-    async handleSelectNode(cid) {
-        if (cid === null || !this._debugSession) {
+    async handleSelectNode(nodeRef) {
+        if (!this._debugSession) {
             return;
         }
+        console.log('[AsyncInspector] selectNode cid=', nodeRef.cid, 'typeof=', typeof nodeRef.cid);
         const snapshot = this._lastSnapshot;
         if (!snapshot) {
             return;
         }
-        // Find the frame index for this CID in the snapshot path.
-        // The snapshot path is ordered root → leaf (async chain).
-        // We map this to the physical GDB stack frame index.
-        let targetFrameIndex = -1;
-        for (let i = 0; i < snapshot.path.length; i++) {
-            const node = snapshot.path[i];
-            if (node.type === 'async' && node.cid === cid) {
-                targetFrameIndex = snapshot.path.length - 1 - i;
-                break;
-            }
-        }
-        if (targetFrameIndex >= 0) {
-            try {
-                // Get real frame IDs from the stack trace
-                const stackTrace = await this._debugSession.customRequest('stackTrace', {
-                    threadId: snapshot.thread_id,
-                    startFrame: 0,
-                    levels: 200,
-                });
-                const frames = stackTrace?.stackFrames || [];
-                if (frames.length > targetFrameIndex) {
-                    const frame = frames[targetFrameIndex];
-                    // Use evaluate to switch GDB to this frame, which updates
-                    // the variables view via the debug session
-                    await this._debugSession.customRequest('evaluate', {
-                        expression: `frame ${targetFrameIndex}`,
-                        context: 'repl',
-                    });
-                    // Also open the source file at the frame location
-                    if (frame.source?.path) {
-                        await this.handleSelectFrame(frame.source.path, frame.line || 0);
-                    }
+        // Case 1: normal CID-backed async node
+        if (nodeRef.cid !== null) {
+            const targetCid = Number(nodeRef.cid);
+            let targetFrameIndex = -1;
+            for (let i = 0; i < snapshot.path.length; i++) {
+                const node = snapshot.path[i];
+                if (node.type === 'async' && Number(node.cid) === targetCid) {
+                    targetFrameIndex = snapshot.path.length - 1 - i;
+                    break;
                 }
             }
-            catch (error) {
-                console.error('Failed to switch frame:', error);
+            if (targetFrameIndex >= 0) {
+                try {
+                    const stackTrace = await this._debugSession.customRequest('stackTrace', {
+                        threadId: snapshot.thread_id,
+                        startFrame: 0,
+                        levels: 200,
+                    });
+                    const frames = stackTrace?.stackFrames || [];
+                    if (frames.length > targetFrameIndex) {
+                        const frame = frames[targetFrameIndex];
+                        await this._debugSession.customRequest('evaluate', {
+                            expression: `frame ${targetFrameIndex}`,
+                            context: 'repl',
+                        });
+                        const snapNode = snapshot.path.find(n => n.type === 'async' && Number(n.cid) === targetCid);
+                        const sourcePath = snapNode?.file ||
+                            snapNode?.fullname ||
+                            frame.source?.path ||
+                            '';
+                        const sourceLine = snapNode?.line ||
+                            frame.line ||
+                            0;
+                        console.log('[AsyncInspector] root-select', {
+                            nodeRef,
+                            targetCid,
+                            snapNode,
+                            sourcePath,
+                            sourceLine,
+                        });
+                        if (sourcePath) {
+                            await this.handleSelectFrame(sourcePath, sourceLine);
+                        }
+                    }
+                }
+                catch (error) {
+                    console.error('Failed to switch frame:', error);
+                }
             }
+            return;
+        }
+        // Case 2: async node without CID — fallback to source jump only
+        const target = snapshot.path.find(n => n.type === 'async' &&
+            n.cid === null &&
+            n.func === nodeRef.func &&
+            n.addr === nodeRef.addr);
+        const filePath = target?.file ||
+            target?.fullname ||
+            nodeRef.file ||
+            nodeRef.fullname ||
+            '';
+        const line = target?.line ||
+            nodeRef.line ||
+            0;
+        console.log('[AsyncInspector] child-select', {
+            nodeRef,
+            target,
+            filePath,
+            line,
+        });
+        if (filePath) {
+            await this.handleSelectFrame(filePath, line);
         }
     }
     async handleLocate(symbol) {
@@ -245,6 +283,136 @@ class AsyncInspectorPanel {
             });
         }
     }
+    buildSearchRoots(initialRoots) {
+        const roots = [];
+        const seen = new Set();
+        for (const start of initialRoots) {
+            let current = path.resolve(start);
+            // 向上爬几层，避免 workspace 开在过深子目录时找不到真正源码根
+            for (let i = 0; i < 8; i++) {
+                if (!seen.has(current)) {
+                    seen.add(current);
+                    roots.push(current);
+                }
+                const parent = path.dirname(current);
+                if (parent === current) {
+                    break;
+                }
+                current = parent;
+            }
+        }
+        return roots;
+    }
+    async findFileBySuffix(roots, suffix) {
+        const normalizedSuffix = suffix.replace(/\\/g, '/').toLowerCase();
+        const walk = async (dir) => {
+            let entries;
+            try {
+                entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            }
+            catch {
+                return undefined;
+            }
+            for (const entry of entries) {
+                // 跳过常见无关目录，避免搜索太慢
+                if (entry.isDirectory()) {
+                    if (entry.name === '.git' ||
+                        entry.name === 'node_modules' ||
+                        entry.name === 'target' ||
+                        entry.name === 'out' ||
+                        entry.name === '.vscode') {
+                        continue;
+                    }
+                }
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    const found = await walk(fullPath);
+                    if (found) {
+                        return found;
+                    }
+                }
+                else if (entry.isFile()) {
+                    const normalizedFull = fullPath.replace(/\\/g, '/').toLowerCase();
+                    if (normalizedFull.endsWith(normalizedSuffix)) {
+                        console.log('[AsyncInspector] findFileBySuffix hit=' + fullPath);
+                        return fullPath;
+                    }
+                }
+            }
+            return undefined;
+        };
+        for (const root of roots) {
+            const found = await walk(root);
+            if (found) {
+                return found;
+            }
+        }
+        return undefined;
+    }
+    async resolveSourceUri(file) {
+        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+        const workspaceRoots = workspaceFolders.map(f => f.uri.fsPath);
+        const searchRoots = this.buildSearchRoots(workspaceRoots);
+        const normalizedInput = file.replace(/\\/g, '/');
+        console.log('[AsyncInspector] resolveSourceUri input file=' + file +
+            ' isAbsolute=' + String(path.isAbsolute(file)) +
+            ' workspaceRoots=' + JSON.stringify(workspaceRoots) +
+            ' searchRoots=' + JSON.stringify(searchRoots));
+        // 1) 绝对路径且真实存在
+        if (path.isAbsolute(file) && fs.existsSync(file)) {
+            console.log('[AsyncInspector] resolveSourceUri absolute-hit=' + file);
+            return vscode.Uri.file(file);
+        }
+        // 2) 坏掉的绝对路径 -> 降级成相对后缀
+        let searchTail = normalizedInput;
+        if (path.isAbsolute(file)) {
+            const parts = normalizedInput.split('/').filter(Boolean);
+            const markers = ['testsuite', 'src', 'tests', 'test', 'examples', 'os'];
+            let markerIndex = -1;
+            for (let i = 0; i < parts.length; i++) {
+                if (markers.includes(parts[i])) {
+                    markerIndex = i;
+                    break;
+                }
+            }
+            if (markerIndex >= 0) {
+                searchTail = parts.slice(markerIndex).join('/');
+            }
+            else {
+                searchTail = parts.slice(-3).join('/');
+            }
+        }
+        // 3) 用所有 searchRoots 直接拼接尝试
+        for (const root of searchRoots) {
+            const candidate = path.join(root, searchTail);
+            console.log('[AsyncInspector] resolveSourceUri candidate=' + candidate);
+            if (fs.existsSync(candidate)) {
+                console.log('[AsyncInspector] resolveSourceUri candidate-hit=' + candidate);
+                return vscode.Uri.file(candidate);
+            }
+        }
+        // 4) 递归后缀搜索
+        const found = await this.findFileBySuffix(searchRoots, searchTail);
+        console.log('[AsyncInspector] resolveSourceUri recursive-found=' + String(found));
+        if (found) {
+            return vscode.Uri.file(found);
+        }
+        console.log('[AsyncInspector] resolveSourceUri failed', {
+            file,
+            searchTail,
+            searchRoots,
+        });
+        return undefined;
+    }
+    async openSourceAt(uri, line) {
+        const doc = await vscode.workspace.openTextDocument(uri);
+        const targetLine = Math.max(0, line - 1);
+        await vscode.window.showTextDocument(doc, {
+            selection: new vscode.Range(targetLine, 0, targetLine, 0),
+            preserveFocus: false,
+            viewColumn: vscode.ViewColumn.One,
+        });
+    }
     /**
      * Handle frame selection from the webview.
      * Opens the source file at the given line in VS Code editor.
@@ -254,39 +422,26 @@ class AsyncInspectorPanel {
             return;
         }
         try {
-            // GDB may return relative paths (e.g. "src/main.rs").
-            // Resolve them against the workspace folder to get an absolute path.
-            let uri;
-            if (file.startsWith('/')) {
-                uri = vscode.Uri.file(file);
+            const uri = await this.resolveSourceUri(file);
+            if (!uri) {
+                vscode.window.showWarningMessage(`Cannot resolve file: ${file}`);
+                return;
             }
-            else {
-                const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri;
-                if (workspaceFolder) {
-                    uri = vscode.Uri.joinPath(workspaceFolder, file);
-                }
-                else {
-                    uri = vscode.Uri.file(file);
-                }
-            }
-            const doc = await vscode.workspace.openTextDocument(uri);
-            const targetLine = Math.max(0, line - 1); // VS Code lines are 0-based
-            await vscode.window.showTextDocument(doc, {
-                selection: new vscode.Range(targetLine, 0, targetLine, 0),
-                preserveFocus: false,
-                viewColumn: vscode.ViewColumn.One,
-            });
+            await this.openSourceAt(uri, line);
         }
         catch (error) {
             console.error('Failed to open source file:', error);
             vscode.window.showWarningMessage(`Cannot open file: ${file}`);
         }
     }
+    getSnapshotNodeOrigin(node) {
+        const origin = node.origin;
+        return typeof origin === 'string' && origin ? origin : undefined;
+    }
     updateTreeFromSnapshot(snapshot) {
         if (snapshot.path.length === 0) {
             return;
         }
-        // Find the root async node (first async node in path)
         let rootIndex = -1;
         for (let i = 0; i < snapshot.path.length; i++) {
             if (snapshot.path[i].type === 'async') {
@@ -295,13 +450,12 @@ class AsyncInspectorPanel {
             }
         }
         if (rootIndex < 0) {
-            return; // No async nodes, keep existing tree
+            return;
         }
         const rootNode = snapshot.path[rootIndex];
         if (rootNode.cid === null) {
             return;
         }
-        // Get or create root tree node
         let root = this._treeRoots.get(rootNode.cid);
         if (!root) {
             root = {
@@ -311,6 +465,10 @@ class AsyncInspectorPanel {
                 addr: rootNode.addr,
                 poll: rootNode.poll,
                 state: rootNode.state,
+                origin: this.getSnapshotNodeOrigin(rootNode),
+                file: rootNode.file,
+                fullname: rootNode.fullname,
+                line: rootNode.line,
                 children: []
             };
             this._treeRoots.set(rootNode.cid, root);
@@ -318,8 +476,11 @@ class AsyncInspectorPanel {
         else {
             root.poll = rootNode.poll;
             root.state = rootNode.state;
+            root.origin = this.getSnapshotNodeOrigin(rootNode);
+            root.file = rootNode.file;
+            root.fullname = rootNode.fullname;
+            root.line = rootNode.line;
         }
-        // Build the child chain from the snapshot path
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
     }
     /**
@@ -333,28 +494,67 @@ class AsyncInspectorPanel {
         let current = parent;
         for (let i = startIndex; i < path.length; i++) {
             const node = path[i];
-            if (node.type === 'async' && node.cid !== null) {
-                // Find existing async child by CID
-                let child = current.children.find(c => c.type === 'async' && c.cid === node.cid);
-                if (!child) {
-                    child = {
-                        type: 'async',
-                        cid: node.cid,
-                        func: node.func,
-                        addr: node.addr,
-                        poll: node.poll,
-                        state: node.state,
-                        children: [],
-                    };
-                    current.children.push(child);
+            if (node.type === 'async') {
+                let child;
+                if (node.cid !== null) {
+                    // 1) 先按真实 CID 找
+                    child = current.children.find(c => c.type === 'async' && c.cid === node.cid);
+                    // 2) 如果没找到，再找“同 func 的旧占位节点”并升级
+                    if (!child) {
+                        const placeholder = current.children.find(c => c.type === 'async' &&
+                            c.cid === null &&
+                            c.func === node.func);
+                        if (placeholder) {
+                            placeholder.cid = node.cid;
+                            placeholder.addr = node.addr;
+                            placeholder.poll = node.poll;
+                            placeholder.state = node.state;
+                            placeholder.origin = this.getSnapshotNodeOrigin(node);
+                            placeholder.file = node.file;
+                            placeholder.fullname = node.fullname;
+                            placeholder.line = node.line;
+                            child = placeholder;
+                        }
+                    }
+                    // 3) 不管 child 是按 CID 找到的，还是由 placeholder 升级来的，
+                    //    都清理掉同 func 的旧 placeholder，避免树里长期残留重复节点
+                    current.children = current.children.filter(c => !(c !== child &&
+                        c.type === 'async' &&
+                        c.cid === null &&
+                        c.func === node.func));
                 }
                 else {
-                    // Update mutable fields
-                    child.poll = node.poll;
-                    child.state = node.state;
+                    child = current.children.find(c => c.type === 'async' &&
+                        c.cid === null &&
+                        c.func === node.func &&
+                        c.addr === node.addr);
                 }
-                // Continue deeper into this child
-                current = child;
+                const nextChild = child ?? {
+                    type: 'async',
+                    cid: node.cid,
+                    func: node.func,
+                    addr: node.addr,
+                    poll: node.poll,
+                    state: node.state,
+                    origin: this.getSnapshotNodeOrigin(node),
+                    children: [],
+                    file: node.file,
+                    fullname: node.fullname,
+                    line: node.line,
+                };
+                if (!child) {
+                    current.children.push(nextChild);
+                }
+                else {
+                    nextChild.poll = node.poll;
+                    nextChild.state = node.state;
+                    nextChild.addr = node.addr;
+                    nextChild.origin = this.getSnapshotNodeOrigin(node);
+                    nextChild.file = node.file;
+                    nextChild.fullname = node.fullname;
+                    nextChild.line = node.line;
+                }
+                current = nextChild;
             }
             else if (node.type === 'sync') {
                 // Dedup sync nodes by func + addr
@@ -367,6 +567,27 @@ class AsyncInspectorPanel {
                         addr: node.addr,
                         poll: 0,
                         state: 'NON-ASYNC',
+                        origin: this.getSnapshotNodeOrigin(node),
+                        children: [],
+                    };
+                    current.children.push(syncChild);
+                }
+                else {
+                    existing.origin = this.getSnapshotNodeOrigin(node);
+                }
+            }
+            else if (node.type === 'sync') {
+                // Dedup sync nodes by func + addr
+                const existing = current.children.find(c => c.type === 'sync' && c.func === node.func && c.addr === node.addr);
+                if (!existing) {
+                    const syncChild = {
+                        type: 'sync',
+                        cid: null,
+                        func: node.func,
+                        addr: node.addr,
+                        poll: 0,
+                        state: 'NON-ASYNC',
+                        origin: this.getSnapshotNodeOrigin(node),
                         children: [],
                     };
                     current.children.push(syncChild);
@@ -417,6 +638,82 @@ class AsyncInspectorPanel {
                     window.treeData = ${JSON.stringify(Array.from(this._treeRoots.values()))};
                 </script>
                 <script src="${scriptUri}"></script>
+                <script>
+                    (function() {
+                        function flattenTree(nodes, out) {
+                            out = out || [];
+                            if (!Array.isArray(nodes)) {
+                                return out;
+                            }
+                            nodes.forEach(function(node) {
+                                out.push(node);
+                                flattenTree(node.children, out);
+                            });
+                            return out;
+                        }
+
+                        function formatDisplayState(node) {
+                            var state = node ? node.state : undefined;
+                            if (state === 'NON-ASYNC') {
+                                return 'NON-ASYNC';
+                            }
+                            if (typeof state === 'number') {
+                                return String(state);
+                            }
+                            if (typeof state === 'string' && state !== 'N/A') {
+                                return state;
+                            }
+
+                            switch (node && node.origin) {
+                                case 'trace':
+                                    return 'unavailable';
+                                case 'trace-upgraded':
+                                    return 'trace-hit, state unavailable';
+                                case 'physical':
+                                    return 'physical-only';
+                                case 'inferred':
+                                    return 'inferred';
+                                default:
+                                    return 'unavailable';
+                            }
+                        }
+
+                        function patchTreeMetadata(nodes) {
+                            var flat = flattenTree(nodes || []);
+                            var metas = document.querySelectorAll('#treeContainer .tree-node .node-meta');
+                            metas.forEach(function(meta, index) {
+                                var node = flat[index];
+                                if (!node) {
+                                    return;
+                                }
+
+                                var origin = node.origin || 'unknown';
+                                var text = meta.textContent || '';
+                                text = text.replace(/\\s*\\|\\s*Origin:\\s*[^|]+$/, '');
+                                text = text.replace(/State:\\s*[^|]+/, 'State: ' + formatDisplayState(node));
+
+                                if ((origin === 'physical' || origin === 'inferred') && Number(node.poll) === 0) {
+                                    text = text.replace(/Poll:\\s*0\\b/, 'Poll: -');
+                                }
+
+                                meta.textContent = text + ' | Origin: ' + origin;
+                            });
+                        }
+
+                        window.addEventListener('message', function(event) {
+                            var message = event.data;
+                            if (message && message.command === 'updateTree') {
+                                setTimeout(function() {
+                                    patchTreeMetadata(message.treeData);
+                                }, 0);
+                            }
+                        });
+
+                        setTimeout(function() {
+                            patchTreeMetadata(window.treeData || []);
+                        }, 0);
+                    })();
+                </script>
             </body>
             </html>`;
     }

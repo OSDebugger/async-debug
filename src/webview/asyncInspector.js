@@ -78,7 +78,15 @@
         div.addEventListener('click', (e) => {
             e.stopPropagation();
             selectNode(node.cid);
-            vscode.postMessage({ command: 'selectNode', cid: node.cid });
+            vscode.postMessage({
+                command: 'selectNode',
+                cid: node.cid,
+                func: node.func,
+                addr: node.addr,
+                file: node.file,
+                fullname: node.fullname,
+                line: node.line,
+            });
         });
 
         // Render children
