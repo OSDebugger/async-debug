@@ -333,6 +333,7 @@ export class GDBDebugSession extends DebugSession {
                         args: h.behavior?.functionArguments !== undefined
                             ? [h.behavior.functionArguments]
                             : (h.behavior?.args ?? []),
+                        isAsync: h.behavior?.isAsync ?? false,
                     },
                 };
                 this.breakpointGroups.updateHookBreakpoint(normalized);
@@ -997,6 +998,7 @@ export class GDBDebugSession extends DebugSession {
                             args: args.behavior?.functionArguments !== undefined
                                 ? [args.behavior.functionArguments]
                                 : (args.behavior?.args ?? []),
+                            isAsync: args.behavior?.isAsync ?? false,
                         },
                     };
                     this.breakpointGroups.updateHookBreakpoint(normalized);
@@ -1016,6 +1018,7 @@ export class GDBDebugSession extends DebugSession {
                             args: args.behavior?.functionArguments !== undefined
                                 ? [args.behavior.functionArguments]
                                 : (args.behavior?.args ?? []),
+                            isAsync: args.behavior?.isAsync ?? false,
                         },
                     };
                     this.breakpointGroups.disableHookBreakpoint(normalized);
