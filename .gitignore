@@ -16,3 +16,4 @@ website/.hugo_build.lock
 .claude/
 docs/
 /out
+CLAUDE.md

@@ -169,6 +169,7 @@ export class GDBDebugSession extends DebugSession {
     private userMemoryRanges: string[][] = [];
     private programCounterId = 32; // RISC-V PC register id
     private currentHook: HookBreakpoint | undefined;
+    private pendingBreakpointNode: MINode | undefined;
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -1210,9 +1211,11 @@ export class GDBDebugSession extends DebugSession {
         this.miDebugger!.on('breakpoint', (node: MINode) => {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
-            this.handleBreakpointHit(node);
             if (this.osDebugReady) {
+                this.pendingBreakpointNode = node;
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                this.handleBreakpointHit(node);
             }
         });
 
@@ -1380,7 +1383,7 @@ export class GDBDebugSession extends DebugSession {
             const borders = this.breakpointGroups?.getCurrentBreakpointGroup()?.borders;
             this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(v => {
                 if (!v || v.length === 0 || !v[0]) {
-                    console.warn('[ardb] check_if_user_to_kernel_border_yet: empty stack');
+                    this.sendUserStoppedEvent();
                     return;
                 }
                 const filepath = v[0].file;
@@ -1388,11 +1391,13 @@ export class GDBDebugSession extends DebugSession {
                 if (borders) {
                     for (const border of borders) {
                         if (filepath === border.filepath && lineNumber === border.line) {
+                            this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
-                            break;
+                            return;
                         }
                     }
                 }
+                this.sendUserStoppedEvent();
             });
         }
         else if (action.type === DebuggerActions.start_consecutive_single_steps) {
@@ -1433,6 +1438,43 @@ export class GDBDebugSession extends DebugSession {
             this.breakpointGroups!.updateCurrentBreakpointGroup(highLevelName, true);
             this.breakpointGroups!.setNextBreakpointGroup(lowLevelName);
         }
+        else if (action.type === DebuggerActions.check_stop_in_kernel) {
+            this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(async v => {
+                if (!v || v.length === 0 || !v[0]) {
+                    this.sendUserStoppedEvent();
+                    return;
+                }
+                const filepath = v[0].file;
+                const lineNumber = v[0].line;
+                const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
+                if (!currentGroup) { this.sendUserStoppedEvent(); return; }
+
+                for (const hook of currentGroup.hooks) {
+                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                        try {
+                            const hookResult = await eval(hook.behavior)();
+                            this.breakpointGroups!.setNextBreakpointGroup(hookResult);
+                            this.showInfo('hook matched, next group: ' + hookResult);
+                        } catch (e) { console.error('[ardb] hook eval failed:', e); }
+                        this.pendingBreakpointNode = undefined;
+                        this.miDebugger!.continue();
+                        return;
+                    }
+                }
+
+                if (currentGroup.borders) {
+                    for (const border of currentGroup.borders) {
+                        if (filepath === border.filepath && lineNumber === border.line) {
+                            this.pendingBreakpointNode = undefined;
+                            this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            return;
+                        }
+                    }
+                }
+
+                this.sendUserStoppedEvent();
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1455,6 +1497,17 @@ export class GDBDebugSession extends DebugSession {
         (event.body as any).hitBreakpointIds = dapId ? [dapId] : [];
         (event.body as any).allThreadsStopped = true;
         this.sendEvent(event);
+    }
+
+    private sendUserStoppedEvent(): void {
+        if (this.pendingBreakpointNode) {
+            this.handleBreakpointHit(this.pendingBreakpointNode);
+            this.pendingBreakpointNode = undefined;
+        } else {
+            const event = new StoppedEvent('pause', this.recentStopThreadId);
+            (event.body as any).allThreadsStopped = true;
+            this.sendEvent(event);
+        }
     }
 
     private handleBreakpointModified(node: MINode): void {
