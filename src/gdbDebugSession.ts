@@ -1333,16 +1333,46 @@ export class GDBDebugSession extends DebugSession {
      */
     public async getStringVariable(name: string): Promise<string> {
         if (!this.miDebugger) return '';
-        const node = await this.miDebugger.sendCliCommand('x /s ' + name);
-        const matches = this.miDebugger.getOriginallyNoTokenMINodes(node.token);
-        if (!matches || matches.length === 0 || !matches[0].outOfBandRecord || matches[0].outOfBandRecord.length === 0) {
-            this.showInfo(`getStringVariable('${name}'): no output`);
+        try {
+            const lenRes = await this.miDebugger.sendCommand(
+                `data-evaluate-expression ${name}.vec.len`
+            );
+            const len = parseInt((lenRes.result('value') || '').trim(), 10);
+            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
+                this.showInfo(`getStringVariable('${name}'): bad len`);
+                return '';
+            }
+
+            const ptrRes = await this.miDebugger.sendCommand(
+                `data-evaluate-expression ${name}.vec.buf.ptr.pointer.pointer`
+            );
+            const ptrStr = ptrRes.result('value') || '';
+            const m = /0x[0-9a-fA-F]+/.exec(ptrStr);
+            if (!m) {
+                this.showInfo(`getStringVariable('${name}'): no addr`);
+                return '';
+            }
+            const addr = m[0];
+
+            const memRes = await this.miDebugger.sendCommand(
+                `data-read-memory-bytes ${addr} ${len}`
+            );
+            const contents: string = memRes.result('memory[0].contents') || '';
+            if (!contents) {
+                this.showInfo(`getStringVariable('${name}'): empty memory`);
+                return '';
+            }
+
+            let out = '';
+            for (let i = 0; i + 1 < contents.length; i += 2) {
+                out += String.fromCharCode(parseInt(contents.substr(i, 2), 16));
+            }
+            this.showInfo(`getStringVariable got: ${out}`);
+            return out;
+        } catch (e: any) {
+            this.showInfo(`getStringVariable('${name}') failed: ${e?.message ?? e}`);
             return '';
         }
-        const resultstring = matches[0].outOfBandRecord[0].content || '';
-        this.showInfo(`getStringVariable got: ${resultstring}`);
-        const m = /"(.*?)"/.exec(resultstring);
-        return m ? m[1] : '';
     }
 
     private doAction(action: Action): void {
