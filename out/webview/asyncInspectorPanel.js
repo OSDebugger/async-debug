@@ -621,6 +621,9 @@ class AsyncInspectorPanel {
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
                         <button id="snapshotBtn" class="btn">Snapshot</button>
                     </div>
+                    <div style="padding: 0 10px 10px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;">
+                        Snapshot reflects the current stopped execution context. Trace hits may not appear in the tree unless execution is stopped near the related poll/await site.
+                    </div>
                     <div class="main-content">
                         <div class="tree-panel">
                             <h3>Async Execution Tree</h3>

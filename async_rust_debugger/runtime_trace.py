@@ -59,6 +59,7 @@ _TLS_STACK = {}        # thread_num -> [coro_id, ...]
 _LAST_CHILD_HIT_BY_PARENT = {}
 _LAST_CHILD_HIT_BY_CALLER_FRAME = {}
 _LAST_CHILD_HIT_BY_FUNC_ADDR = {}
+_CHILD_KEY_MISS_LOGGED = set()
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
@@ -192,11 +193,19 @@ def _first_arg_reg() -> str:
     Return the architecture-appropriate register name for the first argument.
     x86_64 SysV -> rdi
     ARM/Thumb (AAPCS) -> r0
+    AArch64 (AAPCS64) -> x0
+    RISC-V -> a0
     """
     try:
         arch_name = gdb.selected_frame().architecture().name().lower()
     except Exception:
         arch_name = ""
+
+    if "aarch64" in arch_name:
+        return "x0"
+
+    if "riscv" in arch_name:
+        return "a0"
 
     if "arm" in arch_name or "thumb" in arch_name:
         return "r0"
@@ -612,8 +621,8 @@ def _symbol_query_tokens(ty: str) -> list[str]:
 def _future_type_to_poll_symbol(future_ty: str) -> str | None:
     """
     Best-effort mapping:
-      lilos::exec::YieldCpu
-        -> <lilos::exec::YieldCpu as core::future::future::Future>::poll
+      my_crate::FutureType
+        -> <my_crate::FutureType as core::future::future::Future>::poll
 
     Strategy:
       1) Query by full type name, base name, and split tokens
@@ -967,6 +976,17 @@ def _has_existing_real_async_child(snapshot_path, phys_tail, leaf_func: str) -> 
         pass
     return False
 
+def _should_log_child_key_miss(leaf_func: str, node_addr: str) -> bool:
+    if not leaf_func:
+        return False
+
+    key = (leaf_func, node_addr)
+    if key in _CHILD_KEY_MISS_LOGGED:
+        return False
+
+    _CHILD_KEY_MISS_LOGGED.add(key)
+    return True
+
 def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
     """
     Recursively unwrap a GDB value to extract the raw memory address.
@@ -1090,6 +1110,7 @@ def _cleanup_run_scoped():
     _LAST_CHILD_HIT_BY_PARENT.clear()
     _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
     _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
+    _CHILD_KEY_MISS_LOGGED.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
 
@@ -1329,6 +1350,7 @@ class ARDResetCommand(gdb.Command):
         _LAST_CHILD_HIT_BY_PARENT.clear()
         _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
         _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
+        _CHILD_KEY_MISS_LOGGED.clear()
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
@@ -1600,7 +1622,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                                         _log_ard(
                                             f"[ARD] snapshot-upgrade-by-child-key child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
                                         )
-                                    elif "MaybeDone" in leaf_func:
+                                    elif _should_log_child_key_miss(leaf_func, node_addr):
                                         _log_ard(
                                             f"[ARD] snapshot-upgrade-by-child-key miss child={leaf_func} node_addr={node_addr}"
                                         )
