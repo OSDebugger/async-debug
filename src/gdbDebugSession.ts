@@ -1455,7 +1455,10 @@ export class GDBDebugSession extends DebugSession {
                             const hookResult = await eval(hook.behavior)();
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
                             this.showInfo('hook matched, next group: ' + hookResult);
-                        } catch (e) { console.error('[ardb] hook eval failed:', e); }
+                        } catch (e: any) {
+                            this.showInfo('hook eval failed: ' + (e?.message ?? e));
+                            console.error('[ardb] hook eval failed:', e);
+                        }
                         this.pendingBreakpointNode = undefined;
                         this.miDebugger!.continue();
                         return;
