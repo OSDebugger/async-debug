@@ -1326,6 +1326,25 @@ export class GDBDebugSession extends DebugSession {
         this.sendEvent({ event: 'showInformationMessage', type: 'event', body: msg, seq: 0 } as any);
     }
 
+    /**
+     * Read a C-string variable from GDB. Used by hook breakpoint behaviors
+     * (which capture `this` via arrow functions) to fetch e.g. the `path`
+     * argument of `sys_exec` and decide which user breakpoint group to switch to.
+     */
+    public async getStringVariable(name: string): Promise<string> {
+        if (!this.miDebugger) return '';
+        const node = await this.miDebugger.sendCliCommand('x /s ' + name);
+        const matches = this.miDebugger.getOriginallyNoTokenMINodes(node.token);
+        if (!matches || matches.length === 0 || !matches[0].outOfBandRecord || matches[0].outOfBandRecord.length === 0) {
+            this.showInfo(`getStringVariable('${name}'): no output`);
+            return '';
+        }
+        const resultstring = matches[0].outOfBandRecord[0].content || '';
+        this.showInfo(`getStringVariable got: ${resultstring}`);
+        const m = /"(.*?)"/.exec(resultstring);
+        return m ? m[1] : '';
+    }
+
     private doAction(action: Action): void {
         if (!this.miDebugger) return;
 
