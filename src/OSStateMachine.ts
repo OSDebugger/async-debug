@@ -48,6 +48,7 @@ export enum DebuggerActions {
 	low_level_switch_breakpoint_group_to_high_level,
 	high_level_switch_breakpoint_group_to_low_level,
 	try_get_next_breakpoint_group_name,
+	check_stop_in_kernel,
 }
 
 // the OSStateMachine const is exported while the OSStateMachine type is NOT.
@@ -60,8 +61,7 @@ export const OSStateMachine: OSStateMachine = {
 				[OSEvents.STOPPED]: {
 					target: OSStates.kernel,
 					actions: [
-						{ type: DebuggerActions.try_get_next_breakpoint_group_name }, //if got, save it to a variable. if not, stay the same. initial is "initproc"
-						{ type: DebuggerActions.check_if_kernel_to_user_border_yet }, //if yes, event `AT_KERNEL_TO_USER_BORDER` happens
+						{ type: DebuggerActions.check_stop_in_kernel },
 					]
 				},
 				[OSEvents.AT_KERNEL_TO_USER_BORDER]: {

@@ -68,12 +68,11 @@ function transition(state: OSStates, event: OSEvents): [OSState, Action[]] {
 // kernel state
 // ---------------------------------------------------------------------------
 {
-    // STOPPED in kernel → stays in kernel, runs try_get_next + check_if_kernel_to_user_border
+    // STOPPED in kernel → stays in kernel, runs check_stop_in_kernel (unified action)
     const [next, actions] = transition(OSStates.kernel, OSEvents.STOPPED);
     assertEq(next.status, OSStates.kernel, 'kernel + STOPPED → stays kernel');
     assertActions(actions, [
-        DebuggerActions.try_get_next_breakpoint_group_name,
-        DebuggerActions.check_if_kernel_to_user_border_yet,
+        DebuggerActions.check_stop_in_kernel,
     ], 'kernel + STOPPED actions');
 }
 {

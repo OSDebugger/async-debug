@@ -45,10 +45,11 @@ export class HookBreakpointJSONFriendly {
 	behavior!: ObjectAsFunction;
 }
 
-export type ObjectAsFunction = { body: string; args: string[] };
+export type ObjectAsFunction = { body: string; args: string[]; isAsync?: boolean };
 
 export function toFunctionString(obj: ObjectAsFunction): FunctionString {
-	return `(function(${obj.args.join(",")}) { ${obj.body} })`;
+	const prefix = obj.isAsync ? 'async ' : '';
+	return `${prefix}(${obj.args.join(",")}) => { ${obj.body} }`;
 }
 
 export function toHookBreakpoint(h: HookBreakpointJSONFriendly): HookBreakpoint {

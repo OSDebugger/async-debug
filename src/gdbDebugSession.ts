@@ -169,6 +169,7 @@ export class GDBDebugSession extends DebugSession {
     private userMemoryRanges: string[][] = [];
     private programCounterId = 32; // RISC-V PC register id
     private currentHook: HookBreakpoint | undefined;
+    private pendingBreakpointNode: MINode | undefined;
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -332,6 +333,7 @@ export class GDBDebugSession extends DebugSession {
                         args: h.behavior?.functionArguments !== undefined
                             ? [h.behavior.functionArguments]
                             : (h.behavior?.args ?? []),
+                        isAsync: h.behavior?.isAsync ?? false,
                     },
                 };
                 this.breakpointGroups.updateHookBreakpoint(normalized);
@@ -996,6 +998,7 @@ export class GDBDebugSession extends DebugSession {
                             args: args.behavior?.functionArguments !== undefined
                                 ? [args.behavior.functionArguments]
                                 : (args.behavior?.args ?? []),
+                            isAsync: args.behavior?.isAsync ?? false,
                         },
                     };
                     this.breakpointGroups.updateHookBreakpoint(normalized);
@@ -1015,6 +1018,7 @@ export class GDBDebugSession extends DebugSession {
                             args: args.behavior?.functionArguments !== undefined
                                 ? [args.behavior.functionArguments]
                                 : (args.behavior?.args ?? []),
+                            isAsync: args.behavior?.isAsync ?? false,
                         },
                     };
                     this.breakpointGroups.disableHookBreakpoint(normalized);
@@ -1210,9 +1214,11 @@ export class GDBDebugSession extends DebugSession {
         this.miDebugger!.on('breakpoint', (node: MINode) => {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
-            this.handleBreakpointHit(node);
             if (this.osDebugReady) {
+                this.pendingBreakpointNode = node;
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
+            } else {
+                this.handleBreakpointHit(node);
             }
         });
 
@@ -1320,6 +1326,55 @@ export class GDBDebugSession extends DebugSession {
         this.sendEvent({ event: 'showInformationMessage', type: 'event', body: msg, seq: 0 } as any);
     }
 
+    /**
+     * Read a C-string variable from GDB. Used by hook breakpoint behaviors
+     * (which capture `this` via arrow functions) to fetch e.g. the `path`
+     * argument of `sys_exec` and decide which user breakpoint group to switch to.
+     */
+    public async getStringVariable(name: string): Promise<string> {
+        if (!this.miDebugger) return '';
+        try {
+            const lenRes = await this.miDebugger.sendCommand(
+                `data-evaluate-expression ${name}.vec.len`
+            );
+            const len = parseInt((lenRes.result('value') || '').trim(), 10);
+            if (!Number.isFinite(len) || len <= 0 || len > 4096) {
+                this.showInfo(`getStringVariable('${name}'): bad len`);
+                return '';
+            }
+
+            const ptrRes = await this.miDebugger.sendCommand(
+                `data-evaluate-expression ${name}.vec.buf.ptr.pointer.pointer`
+            );
+            const ptrStr = ptrRes.result('value') || '';
+            const m = /0x[0-9a-fA-F]+/.exec(ptrStr);
+            if (!m) {
+                this.showInfo(`getStringVariable('${name}'): no addr`);
+                return '';
+            }
+            const addr = m[0];
+
+            const memRes = await this.miDebugger.sendCommand(
+                `data-read-memory-bytes ${addr} ${len}`
+            );
+            const contents: string = memRes.result('memory[0].contents') || '';
+            if (!contents) {
+                this.showInfo(`getStringVariable('${name}'): empty memory`);
+                return '';
+            }
+
+            let out = '';
+            for (let i = 0; i + 1 < contents.length; i += 2) {
+                out += String.fromCharCode(parseInt(contents.substr(i, 2), 16));
+            }
+            this.showInfo(`getStringVariable got: ${out}`);
+            return out;
+        } catch (e: any) {
+            this.showInfo(`getStringVariable('${name}') failed: ${e?.message ?? e}`);
+            return '';
+        }
+    }
+
     private doAction(action: Action): void {
         if (!this.miDebugger) return;
 
@@ -1380,7 +1435,7 @@ export class GDBDebugSession extends DebugSession {
             const borders = this.breakpointGroups?.getCurrentBreakpointGroup()?.borders;
             this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(v => {
                 if (!v || v.length === 0 || !v[0]) {
-                    console.warn('[ardb] check_if_user_to_kernel_border_yet: empty stack');
+                    this.sendUserStoppedEvent();
                     return;
                 }
                 const filepath = v[0].file;
@@ -1388,11 +1443,13 @@ export class GDBDebugSession extends DebugSession {
                 if (borders) {
                     for (const border of borders) {
                         if (filepath === border.filepath && lineNumber === border.line) {
+                            this.pendingBreakpointNode = undefined;
                             this.osStateTransition(new OSEvent(OSEvents.AT_USER_TO_KERNEL_BORDER));
-                            break;
+                            return;
                         }
                     }
                 }
+                this.sendUserStoppedEvent();
             });
         }
         else if (action.type === DebuggerActions.start_consecutive_single_steps) {
@@ -1433,6 +1490,46 @@ export class GDBDebugSession extends DebugSession {
             this.breakpointGroups!.updateCurrentBreakpointGroup(highLevelName, true);
             this.breakpointGroups!.setNextBreakpointGroup(lowLevelName);
         }
+        else if (action.type === DebuggerActions.check_stop_in_kernel) {
+            this.miDebugger.getStack(0, 1, this.recentStopThreadId).then(async v => {
+                if (!v || v.length === 0 || !v[0]) {
+                    this.sendUserStoppedEvent();
+                    return;
+                }
+                const filepath = v[0].file;
+                const lineNumber = v[0].line;
+                const currentGroup = this.breakpointGroups?.getCurrentBreakpointGroup();
+                if (!currentGroup) { this.sendUserStoppedEvent(); return; }
+
+                for (const hook of currentGroup.hooks) {
+                    if (filepath === hook.breakpoint.file && lineNumber === hook.breakpoint.line) {
+                        try {
+                            const hookResult = await eval(hook.behavior)();
+                            this.breakpointGroups!.setNextBreakpointGroup(hookResult);
+                            this.showInfo('hook matched, next group: ' + hookResult);
+                        } catch (e: any) {
+                            this.showInfo('hook eval failed: ' + (e?.message ?? e));
+                            console.error('[ardb] hook eval failed:', e);
+                        }
+                        this.pendingBreakpointNode = undefined;
+                        this.miDebugger!.continue();
+                        return;
+                    }
+                }
+
+                if (currentGroup.borders) {
+                    for (const border of currentGroup.borders) {
+                        if (filepath === border.filepath && lineNumber === border.line) {
+                            this.pendingBreakpointNode = undefined;
+                            this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            return;
+                        }
+                    }
+                }
+
+                this.sendUserStoppedEvent();
+            });
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1455,6 +1552,17 @@ export class GDBDebugSession extends DebugSession {
         (event.body as any).hitBreakpointIds = dapId ? [dapId] : [];
         (event.body as any).allThreadsStopped = true;
         this.sendEvent(event);
+    }
+
+    private sendUserStoppedEvent(): void {
+        if (this.pendingBreakpointNode) {
+            this.handleBreakpointHit(this.pendingBreakpointNode);
+            this.pendingBreakpointNode = undefined;
+        } else {
+            const event = new StoppedEvent('pause', this.recentStopThreadId);
+            (event.body as any).allThreadsStopped = true;
+            this.sendEvent(event);
+        }
     }
 
     private handleBreakpointModified(node: MINode): void {
