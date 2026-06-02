@@ -38,6 +38,9 @@ exports.ARDDebugAdapterFactory = void 0;
 const vscode = __importStar(require("vscode"));
 const path = __importStar(require("path"));
 const gdbDebugSession_1 = require("./gdbDebugSession");
+function expandWorkspaceFolder(value, workspaceFolder) {
+    return value.replace(/\$\{workspaceFolder\}/g, workspaceFolder);
+}
 class ARDDebugAdapterFactory {
     constructor(context) {
         this.context = context;
@@ -47,17 +50,23 @@ class ARDDebugAdapterFactory {
         const config = session.configuration;
         const workspaceFolder = session.workspaceFolder?.uri.fsPath || process.cwd();
         const extensionPath = this.context.extensionPath;
-        const pythonPath = extensionPath;
-        const tempDir = path.join(workspaceFolder, 'temp');
         const adapterScript = path.join(extensionPath, 'out', 'gdbAdapter.js');
+        const configEnv = config.env || {};
         const gdbPath = config.gdbPath || 'gdb';
         const targetRemote = config.targetRemote || '';
         const gdbArch = config.gdbArch || '';
-        const adapterCwd = config.cwd || workspaceFolder;
+        const adapterCwd = expandWorkspaceFolder(config.cwd || workspaceFolder, workspaceFolder);
+        const configuredTempDir = expandWorkspaceFolder(configEnv.ASYNC_RUST_DEBUGGER_TEMP_DIR || path.join(workspaceFolder, 'temp'), workspaceFolder);
+        const tempDir = path.isAbsolute(configuredTempDir)
+            ? configuredTempDir
+            : path.resolve(adapterCwd, configuredTempDir);
+        const pythonPath = expandWorkspaceFolder(configEnv.PYTHONPATH || extensionPath, workspaceFolder);
+        this.gdbSession.setDebugSession(session);
         return new vscode.DebugAdapterExecutable('node', [adapterScript], {
             cwd: adapterCwd,
             env: {
                 ...process.env,
+                ...configEnv,
                 ARDB_PROGRAM: config.program,
                 ARDB_ARGS: JSON.stringify(config.args || []),
                 ARDB_CWD: adapterCwd,

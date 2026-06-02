@@ -1,0 +1,19 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug rel4-async kernel (ARD attach)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/build-rel4-async-debuginfo-only/kernel/kernel.elf",
+      "cwd": "${workspaceFolder}",
+      "gdbPath": "gdb-multiarch",
+      "targetRemote": ":1234",
+      "gdbArch": "riscv:rv64",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/../..",
+        "ASYNC_RUST_DEBUGGER_TEMP_DIR": "${workspaceFolder}/temp"
+      }
+    }
+  ]
+}

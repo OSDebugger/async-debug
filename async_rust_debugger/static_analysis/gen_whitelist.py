@@ -2,6 +2,27 @@ import os
 import re
 import gdb
 
+KNOWN_FRAMEWORK_CRATES: set[str] = {
+    "core",
+    "std",
+    "alloc",
+    "futures",
+    "futures_util",
+    "cortex_m",
+    "cortex_m_rt",
+}
+
+def _extract_crate_name(symbol: str) -> str:
+    s = symbol.strip()
+    if not s:
+        return ""
+
+    if s.startswith("<"):
+        s = s[1:]
+        s = s.split(" as ", 1)[0].strip()
+
+    return s.split("::", 1)[0].strip()
+
 def parse_info_functions(output: str):
     functions = []
     current_file = None
@@ -90,3 +111,50 @@ def gen_default_whitelist():
     out_dir = os.path.join(cwd, temp_dir)
     out_path = os.path.join(out_dir, "poll_functions.txt")
     gen_poll_whitelist(out_path)
+
+def gen_grouped_whitelist(out_path: str):
+    import json
+
+    output = gdb.execute("info functions", to_string=True)
+    funcs = parse_info_functions(output)
+
+    grouped = {
+        "crates": {},
+    }
+
+    seen = set()
+    for f in funcs:
+        rt = f.get("return_type") or ""
+        if "core::task::poll::Poll<" not in rt:
+            continue
+
+        sym = _extract_symbol_name(f["signature"])
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+
+        crate_name = _extract_crate_name(sym)
+        is_framework = crate_name in KNOWN_FRAMEWORK_CRATES
+        kind = "async" if ("{async_fn#" in sym or "{async_block#" in sym) else "poll"
+
+        crate_info = grouped["crates"].setdefault(crate_name, {
+            "name": crate_name,
+            "is_framework": is_framework,
+            "is_user_crate": not is_framework,
+            "symbols": [],
+        })
+        crate_info["symbols"].append({
+            "name": sym,
+            "kind": kind,
+            "file": f.get("file"),
+            "line": f.get("line"),
+            "return_type": rt,
+        })
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fp:
+        json.dump(grouped, fp, indent=2, sort_keys=True)
+        fp.write("\n")
+
+    symbol_count = sum(len(c["symbols"]) for c in grouped["crates"].values())
+    gdb.write(f"[ARD] wrote grouped whitelist: {symbol_count} symbols -> {out_path}\n")

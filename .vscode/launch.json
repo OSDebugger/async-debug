@@ -31,6 +31,21 @@
       "internalConsoleOptions": "openOnSessionStart"
     },
     {
+      "name": "Run Extension - rel4-async",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}",
+        "${workspaceFolder}/testcases/rel4-async"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/out/**/*.js"
+      ],
+      "preLaunchTask": "npm: compile",
+      "sourceMaps": true,
+      "internalConsoleOptions": "openOnSessionStart"
+    },
+    {
       "name": "Debug Adapter (standalone)",
       "type": "node",
       "request": "launch",

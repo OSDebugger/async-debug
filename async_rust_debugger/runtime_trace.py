@@ -186,7 +186,10 @@ def _read_ptr(addr: int) -> int:
     return struct.unpack("<I", mem)[0]
 
 def _reg_u64(name: str) -> int:
-    return int(gdb.parse_and_eval(f"${name}"))
+    addr = _normalize_addr(gdb.parse_and_eval(f"${name}"))
+    if addr is None:
+        raise ValueError(f"cannot normalize register ${name}")
+    return addr
 
 def _first_arg_reg() -> str:
     """
@@ -267,19 +270,82 @@ def _find_pc_function_name(addr: int) -> str | None:
     except Exception:
         return None
 
-def _function_range() -> tuple[int, int] | None:
-    blk = gdb.selected_frame().block()
-    while blk is not None and blk.function is None:
-        blk = blk.superblock
-    if blk is None or blk.start is None or blk.end is None:
-        return None
-    return (int(blk.start), int(blk.end))
+def _parse_info_symbol_range(addr: int, window: int = 0x200):
+    raw = _info_symbol_raw(addr)
+    if not raw or raw.startswith("No symbol matches"):
+        return (addr, addr + window, None)
+
+    head = raw.split(" in section", 1)[0].strip()
+    name = head
+    offset = 0
+    m = re.match(r"^(.*) \+ (0x[0-9a-fA-F]+|[0-9]+)$", head)
+    if m:
+        name = m.group(1).strip()
+        off_s = m.group(2)
+        try:
+            offset = int(off_s, 0)
+        except Exception:
+            offset = 0
+
+    start = max(0, addr - offset)
+    if name:
+        for resolver in (_try_addr_by_lookup_global_symbol, _try_addr_by_info_address):
+            try:
+                resolved = resolver(name)
+            except Exception:
+                resolved = None
+            if resolved is not None and resolved <= addr:
+                start = int(resolved)
+                break
+    end = start + window
+    return (start, end, name or None)
+
+def _function_range(frame=None) -> tuple[int, int, str | None, bool] | None:
+    frame = frame or gdb.selected_frame()
+    try:
+        blk = frame.block()
+        while blk is not None and blk.function is None:
+            blk = blk.superblock
+        if blk is not None and blk.start is not None and blk.end is not None:
+            name = None
+            try:
+                name = str(blk.function.print_name) if blk.function is not None else None
+            except Exception:
+                name = None
+            return (int(blk.start), int(blk.end), name, False)
+    except (gdb.error, RuntimeError, Exception) as e:
+        block_error = e
+    else:
+        block_error = None
+
+    try:
+        pc = int(frame.pc())
+    except Exception:
+        try:
+            pc = _current_pc()
+        except Exception:
+            _log_ard("[ARD] warning: cannot get function range: no debug block and no pc")
+            return None
+
+    start, end, name = _parse_info_symbol_range(pc)
+    if name:
+        _log_ard(f"[ARD] warning: no debug block for {name}; using fallback range {start:#x}..{end:#x}")
+    else:
+        _log_ard(f"[ARD] warning: no debug block near pc={pc:#x}; using fallback range {start:#x}..{end:#x}")
+    if block_error is not None:
+        _log_ard(f"[ARD] warning: frame.block unavailable: {block_error}")
+    return (start, end, name, True)
 
 def _collect_call_sites() -> list[int]:
     r = _function_range()
     if r is None:
-        raise gdb.error("cannot get function range")
-    start, end = r
+        _log_ard("[ARD] warning: cannot get function range; skipping call-site scan")
+        return []
+    start, end, name, degraded = r
+    if degraded:
+        label = name or f"{start:#x}"
+        _log_ard(f"[ARD] warning: skipping call-site scan for no-debug-block function {label}")
+        return []
     arch = gdb.selected_frame().architecture()
     insns = arch.disassemble(start, end)
 
@@ -694,7 +760,9 @@ def _infer_child_poll_from_current_frame(awaitee_ty: str) -> str | None:
         r = _function_range()
         if r is None:
             return None
-        start, end = r
+        start, end, _name, degraded = r
+        if degraded:
+            return None
         arch = gdb.selected_frame().architecture()
         insns = arch.disassemble(start, end)
     except Exception:
@@ -804,7 +872,7 @@ def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
             return None
         v = sym.value()
         voidp = gdb.lookup_type("char").pointer()
-        return int(v.cast(charp))
+        return int(v.cast(voidp))
     except Exception:
         return None
 
@@ -907,6 +975,14 @@ def _log_ard(message: str, to_console: bool = False):
     if to_console:
         gdb.write(message + "\n")
 
+def _ard_diag_enabled() -> bool:
+    value = os.environ.get("ARD_DIAG") or os.environ.get("ARDB_DIAG") or ""
+    return value.lower() in ("1", "true", "yes", "on")
+
+def _log_diag(message: str):
+    if _ard_diag_enabled():
+        _log_ard(message)
+
 # -------------------------
 # Callee selection
 # -------------------------
@@ -922,6 +998,8 @@ def _is_async_symbol(sym_name: str) -> bool:
     2. Symbol is in the async set from the grouped whitelist (e.g. manual Future::poll impls)
     """
     if ("{async_fn#" in sym_name) or ("{async_block#" in sym_name):
+        return True
+    if "async_runtime::coroutine::Coroutine::execute" in sym_name:
         return True
     if _ASYNC_SYMBOL_SET is not None and sym_name in _ASYNC_SYMBOL_SET:
         return True
@@ -1002,7 +1080,8 @@ def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
     Recursion depth is capped to avoid infinite loops on pathological types.
     """
     if depth > 8:
-        return int(val) if val else 0
+        result = _normalize_addr(val)
+        return result if result and result > 0xffff else 0
 
     try:
         ty = val.type.strip_typedefs()
@@ -1010,7 +1089,8 @@ def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
 
         # Pointer or reference — this is what we want
         if code in (gdb.TYPE_CODE_PTR, gdb.TYPE_CODE_REF, gdb.TYPE_CODE_RVALUE_REF):
-            return int(val)
+            result = _normalize_addr(val)
+            return result if result and result > 0xffff else 0
 
         # Struct — drill into known wrapper fields
         if code == gdb.TYPE_CODE_STRUCT:
@@ -1036,8 +1116,8 @@ def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
                 pass
 
         # Fallback — direct integer conversion
-        result = int(val)
-        return result if result > 0xffff else 0
+        result = _normalize_addr(val)
+        return result if result and result > 0xffff else 0
     except Exception:
         return 0
 
@@ -1138,25 +1218,98 @@ class PollEntryBP(gdb.Breakpoint):
 
     def stop(self) -> bool:
         fn = _current_function_name()
+        _log_diag(
+            f"[ARD][diag] PollEntryBP.stop enter fn={fn!r} poll_sym={self.poll_sym!r} internal={self.internal!r}"
+        )
+        try:
+            frame = gdb.selected_frame()
+            _log_diag(f"[ARD][diag] frame={frame.name()!r}")
+        except Exception as e:
+            frame = None
+            _log_diag(f"[ARD][diag] frame read failed: {e!r}")
+        try:
+            pc = int(gdb.parse_and_eval("$pc"))
+            _log_diag(f"[ARD][diag] pc=0x{pc:x}")
+            _log_diag(f"[ARD][diag] info_symbol={_info_symbol_raw(pc)!r}")
+        except Exception as e:
+            _log_diag(f"[ARD][diag] pc/symbol failed: {e!r}")
+        try:
+            names = []
+            f = gdb.newest_frame()
+            depth_i = 0
+            while f is not None and depth_i < 8:
+                try:
+                    names.append(f.name())
+                except Exception:
+                    names.append("<name-failed>")
+                f = f.older()
+                depth_i += 1
+            _log_diag(f"[ARD][diag] bt_top={names!r}")
+        except Exception as e:
+            _log_diag(f"[ARD][diag] bt_top failed: {e!r}")
 
         # ---- coro context enter (best-effort) ----
         tid = _thread_id()
         try:
-            this_ptr = _reg_u64(_first_arg_reg())
+            _log_diag(
+                f"[ARD][diag] TLS_STACK before tid={tid} stack={_TLS_STACK.get(tid, [])!r} all={_TLS_STACK!r}"
+            )
+        except Exception as e:
+            _log_diag(f"[ARD][diag] TLS_STACK read failed: {e!r}")
+        self_ptr = 0
+        this_arg_ptr = 0
+        if frame is not None:
+            for arg_name in ("self", "this"):
+                try:
+                    arg_val = frame.read_var(arg_name)
+                    arg_ptr = _extract_raw_ptr(arg_val)
+                    if arg_name == "self":
+                        self_ptr = arg_ptr
+                    else:
+                        this_arg_ptr = arg_ptr
+                    _log_diag(
+                        f"[ARD][diag] arg {arg_name}={arg_val!r} ptr=0x{arg_ptr:x}"
+                    )
+                except Exception as e:
+                    _log_diag(f"[ARD][diag] arg {arg_name} read failed: {e!r}")
+        a0_ptr = 0
+        try:
+            first_arg = _first_arg_reg()
+            raw_reg_val = gdb.parse_and_eval(f"${first_arg}")
+            a0_ptr = _normalize_addr(raw_reg_val) or 0
+            this_ptr = self_ptr or this_arg_ptr or a0_ptr
+            _log_ard(
+                f"[ARD] ptr-selected self=0x{self_ptr:x} this=0x{this_arg_ptr:x} {first_arg}=0x{a0_ptr:x} selected=0x{this_ptr:x}"
+            )
             if this_ptr <= 0x10000:
+                _log_diag(f"[ARD][diag] this_ptr rejected by low-address filter: 0x{this_ptr:x}")
                 this_ptr = 0
-        except Exception:
+        except Exception as e:
+            _log_diag(f"[ARD][diag] first arg read failed: {e!r}")
             this_ptr = 0
+        _log_diag(f"[ARD][diag] final this_ptr=0x{this_ptr:x}")
 
         poll_sym = self.poll_sym or fn
         cid = 0
         is_new = False
         depth = -1
+        _log_diag(f"[ARD][diag] before node create: poll_sym={poll_sym!r} this_ptr=0x{this_ptr:x}")
 
         if poll_sym and this_ptr:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
+            _log_diag(f"[ARD][diag] cid selected: cid={cid!r} is_new={is_new!r}")
             depth = _push_coro(cid)
-            _PopOnReturnBP(tid, cid)
+            _log_diag(
+                f"[ARD][diag] TLS_STACK after push tid={tid} depth={depth} stack={_TLS_STACK.get(tid, [])!r} all={_TLS_STACK!r}"
+            )
+            try:
+                _PopOnReturnBP(tid, cid)
+            except Exception as e:
+                _log_ard(f"[ARD] warning: PopOnReturnBP disabled for cid={cid}: {e!r}")
+        else:
+            _log_ard(
+                f"[ARD] warning: no node created: poll_sym_present={bool(poll_sym)} this_ptr_present={bool(this_ptr)}"
+            )
 
         indent = "  " * max(depth, 0)
 
@@ -1165,6 +1318,7 @@ class PollEntryBP(gdb.Breakpoint):
         if cid:
             seq = _CO_POLL_SEQ.get(cid, 0) + 1
             _CO_POLL_SEQ[cid] = seq
+            _log_diag(f"[ARD][diag] poll sequence updated: cid={cid} seq={seq}")
         if cid and this_ptr:
             addr_hex = hex(this_ptr)
             _LAST_CHILD_HIT_BY_FUNC_ADDR[(poll_sym, addr_hex)] = {
@@ -1174,6 +1328,9 @@ class PollEntryBP(gdb.Breakpoint):
                 "addr": addr_hex,
                 "state": _read_env_state(poll_sym, this_ptr),
             }
+            _log_diag(
+                f"[ARD][diag] node cache updated: poll_sym={poll_sym!r} cid={cid} addr={addr_hex}"
+            )
         # Record the latest direct child poll hit for the current parent.
         try:
             st = _TLS_STACK.get(tid, [])
@@ -1419,6 +1576,18 @@ class ARDGetSnapshotCommand(gdb.Command):
     def invoke(self, arg, from_tty):
         tid = _thread_id()
         stack = _TLS_STACK.get(tid, [])
+        try:
+            _log_diag(
+                f"[ARD][diag] snapshot enter thread={tid} stack={stack!r} all_tls={_TLS_STACK!r}"
+            )
+            _log_diag(
+                f"[ARD][diag] snapshot roots={sorted(_ACTIVE_ROOTS)!r} co_by_key={list(_CO_BY_KEY.keys())[:20]!r}"
+            )
+            _log_diag(
+                f"[ARD][diag] snapshot co_meta={dict(list(_CO_META.items())[:20])!r} poll_seq={dict(list(_CO_POLL_SEQ.items())[:20])!r}"
+            )
+        except Exception as e:
+            _log_diag(f"[ARD][diag] snapshot state diag failed: {e!r}")
         
         snapshot = {
             "thread_id": tid,
@@ -1470,6 +1639,12 @@ class ARDGetSnapshotCommand(gdb.Command):
         phys_tail = []
         shadow_cids = set(stack)  # CIDs already on the shadow stack
         if not stack:
+            try:
+                _log_ard(
+                    f"[ARD] warning: snapshot empty stack: thread={tid} all_tls={_TLS_STACK!r} co_meta={dict(list(_CO_META.items())[:20])!r}"
+                )
+            except Exception as e:
+                _log_diag(f"[ARD][diag] snapshot empty-stack diag failed: {e!r}")
             json_output = json.dumps(snapshot) + "\n"
             gdb.write(json_output)
             temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")

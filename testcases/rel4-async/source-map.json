@@ -1,0 +1,42 @@
+{
+  "name": "rel4-async",
+  "description": "ReL4 rust-root-task-demo async_syscall_test workload for ARD dynamic async runtime tracing.",
+  "sourceWorkspace": "/home/user/AsyncOS/rel4-manifest-workspace",
+  "rel4Kernel": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel",
+  "rootTaskDemo": "/home/user/AsyncOS/rel4-manifest-workspace/projects/rust-root-task-demo",
+  "buildDir": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/build-rel4-async-debuginfo-only",
+  "kernelElf": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/build-rel4-async-debuginfo-only/kernel/kernel.elf",
+  "image": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/build-rel4-async-debuginfo-only/images/example-image-riscv-spike",
+  "qemu": "/home/user/AsyncOS/taic-qemu/build/qemu-system-riscv64",
+  "qemuCpu": "rvgcsu-n",
+  "qemuArgs": [
+    "-machine",
+    "virt",
+    "-cpu",
+    "rvgcsu-n",
+    "-nographic",
+    "-serial",
+    "mon:stdio",
+    "-m",
+    "size=4095M",
+    "-bios",
+    "none",
+    "-smp",
+    "2"
+  ],
+  "gdb": "gdb-multiarch",
+  "features": [
+    "ENABLE_SMP",
+    "ENABLE_UINTC",
+    "board_qemu"
+  ],
+  "cmake": {
+    "PLATFORM": "spike",
+    "SIMULATION": true,
+    "SMP": true,
+    "UINTR": true,
+    "NUM_NODES": 2,
+    "KernelMaxNumNodes": 2
+  },
+  "rustDebugStrategy": "CARGO_PROFILE_RELEASE_DEBUG=2 only; keep release optimization; no opt-level=0, no codegen-units=1, no force-frame-pointers."
+}

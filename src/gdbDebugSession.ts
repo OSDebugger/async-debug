@@ -56,7 +56,7 @@ export class GDBDebugSession {
         // Listen for debug session changes
         vscode.debug.onDidStartDebugSession((session) => {
             if (session.type === 'ardb') {
-                this.debugSession = session;
+                this.setDebugSession(session);
             }
         });
 
@@ -72,9 +72,74 @@ export class GDBDebugSession {
      */
     setDebugSession(session: vscode.DebugSession): void {
         this.debugSession = session;
+        this.configurePaths(this.resolveSessionTempDir(session));
+    }
+
+    private resolveSessionTempDir(session: vscode.DebugSession): string {
+        const workspaceFolder =
+            session.workspaceFolder?.uri.fsPath ||
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        const config = session.configuration || {};
+        const configuredCwd = typeof config.cwd === 'string'
+            ? this.expandWorkspaceFolder(config.cwd, workspaceFolder)
+            : workspaceFolder;
+        const configuredTempDir = config.env?.ASYNC_RUST_DEBUGGER_TEMP_DIR;
+
+        if (typeof configuredTempDir === 'string' && configuredTempDir.trim()) {
+            const expandedTempDir = this.expandWorkspaceFolder(configuredTempDir, workspaceFolder);
+            return path.isAbsolute(expandedTempDir)
+                ? expandedTempDir
+                : path.resolve(configuredCwd || process.cwd(), expandedTempDir);
+        }
+
+        if (workspaceFolder) {
+            return path.join(workspaceFolder, 'temp');
+        }
+
+        if (configuredCwd) {
+            return path.join(configuredCwd, 'temp');
+        }
+
+        return this.tempDir;
+    }
+
+    private expandWorkspaceFolder(value: string, workspaceFolder?: string): string {
+        return workspaceFolder
+            ? value.replace(/\$\{workspaceFolder\}/g, workspaceFolder)
+            : value;
+    }
+
+    private configurePaths(tempDir: string): void {
+        const resolvedTempDir = path.resolve(tempDir);
+        if (this.tempDir === resolvedTempDir && this.fileWatcher) {
+            return;
+        }
+
+        this.tempDir = resolvedTempDir;
+        this.logPath = path.join(this.tempDir, 'ardb.log');
+        this.whitelistPath = path.join(this.tempDir, 'poll_functions.txt');
+
+        if (!fs.existsSync(this.tempDir)) {
+            fs.mkdirSync(this.tempDir, { recursive: true });
+        }
+
+        this.setupWhitelistWatcher();
+    }
+
+    private async loadWhitelist(): Promise<void> {
+        const command = `ardb-load-whitelist ${this.whitelistPath}`;
+        const output = await this.executeGDBCommand(command);
+        if (!output || output.includes('[ARD] failed')) {
+            throw new Error(output.trim() || `No response from: ${command}`);
+        }
+        console.log(`[GDBDebugSession] ${command}: ${output.trim()}`);
     }
 
     private setupWhitelistWatcher(): void {
+        if (this.fileWatcher) {
+            this.fileWatcher.dispose();
+        }
+
         this.fileWatcher = vscode.workspace.createFileSystemWatcher(
             new vscode.RelativePattern(path.dirname(this.whitelistPath), path.basename(this.whitelistPath))
         );
@@ -83,11 +148,12 @@ export class GDBDebugSession {
             if (uri.fsPath === this.whitelistPath && this.debugSession) {
                 // Auto-reload whitelist when file is saved
                 try {
-                    await this.executeGDBCommand('ardb-load-whitelist');
+                    await this.loadWhitelist();
                     const count = await this.getWhitelistSymbolCount();
                     vscode.window.showInformationMessage(`Whitelist reloaded (${count} symbols found)`);
                 } catch (error) {
                     console.error('Failed to reload whitelist:', error);
+                    vscode.window.showErrorMessage(`Failed to reload whitelist: ${error}`);
                 }
             }
         });
@@ -184,11 +250,21 @@ export class GDBDebugSession {
      * Execute ardb-gen-whitelist command and open the file.
      */
     async genWhitelist(): Promise<void> {
-        await this.executeGDBCommand('ardb-gen-whitelist');
-        // Open the generated file
-        if (fs.existsSync(this.whitelistPath)) {
+        try {
+            await this.executeGDBCommand('ardb-gen-whitelist');
+            if (!fs.existsSync(this.whitelistPath)) {
+                throw new Error(`Generated whitelist not found: ${this.whitelistPath}`);
+            }
+
+            await this.loadWhitelist();
+            const count = await this.getWhitelistSymbolCount();
+            vscode.window.showInformationMessage(`Whitelist generated and loaded (${count} symbols found)`);
+
             const doc = await vscode.workspace.openTextDocument(this.whitelistPath);
             await vscode.window.showTextDocument(doc);
+        } catch (error) {
+            console.error('Failed to generate and load whitelist:', error);
+            vscode.window.showErrorMessage(`Failed to generate and load whitelist: ${error}`);
         }
     }
 
