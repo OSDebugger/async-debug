@@ -59,7 +59,17 @@ _TLS_STACK = {}        # thread_num -> [coro_id, ...]
 _LAST_CHILD_HIT_BY_PARENT = {}
 _LAST_CHILD_HIT_BY_CALLER_FRAME = {}
 _LAST_CHILD_HIT_BY_FUNC_ADDR = {}
+_LAST_CHILD_HIT_BY_STRUCTURED = {}
 _CHILD_KEY_MISS_LOGGED = set()
+_PRIVILEGE_STATE = "unknown"
+_PRIVILEGE_TRANSITION_EVENT = "none"
+_PRIVILEGE_LAST_SYMBOL = ""
+_PRIVILEGE_LAST_PC = ""
+_PRIVILEGE_ACTIVE_GROUP = "user"
+_PRIVILEGE_BPS = {
+    "user": [],
+    "kernel": [],
+}
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
@@ -109,6 +119,285 @@ def _current_coro():
     tid = _thread_id()
     st = _TLS_STACK.get(tid, [])
     return (st[-1], len(st) - 1) if st else (0, -1)
+
+
+def _is_valid_state_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        s = value.strip()
+        return s not in ("", "N/A", "unknown", "UNKNOWN", "<unknown>")
+    return True
+
+
+def _state_or_fallback(value, fallback):
+    return value if _is_valid_state_value(value) else fallback
+
+
+def _short_error(e, default: str = "") -> str:
+    if e is None:
+        return default
+    cls = e.__class__.__name__
+    mod = getattr(e.__class__, "__module__", "")
+    if mod == "gdb":
+        cls = f"gdb.{cls}"
+    msg = str(e).strip()
+    out = f"{cls}: {msg}" if msg else cls
+    return out[:180]
+
+
+def _state_info(state="N/A", status: str = "unsupported", error: str = ""):
+    return {
+        "state": state,
+        "state_read_status": status,
+        "state_read_error": error,
+    }
+
+
+def _state_fields(info):
+    return {
+        "state": info.get("state", "N/A"),
+        "state_read_status": info.get("state_read_status", "unsupported"),
+        "state_read_error": info.get("state_read_error", ""),
+    }
+
+
+def _child_hit_fields(match: str = "not_applicable", tid=None, parent_cid=None,
+                      parent_symbol: str = "", child_symbol: str = "",
+                      child_env_addr: str = ""):
+    return {
+        "child_hit_match": match,
+        "child_hit_thread_id": tid,
+        "child_hit_parent_cid": parent_cid,
+        "child_hit_parent_symbol": parent_symbol or "",
+        "child_hit_child_symbol": child_symbol or "",
+        "child_hit_env_addr": child_env_addr or "",
+    }
+
+
+def _is_kernel_addr(addr) -> bool:
+    a = _normalize_addr(addr)
+    if a is None:
+        return False
+    try:
+        ptr_bits = _ptr_size() * 8
+    except Exception:
+        ptr_bits = 64
+    return a >= (1 << (ptr_bits - 1))
+
+
+def _infer_privilege(addr=None, file: str = "", fullname: str = "", func: str = "") -> str:
+    if addr:
+        if _is_kernel_addr(addr):
+            return "kernel"
+        try:
+            a = _normalize_addr(addr)
+            if a is not None and a > 0:
+                return "user"
+        except Exception:
+            pass
+
+    text = " ".join(x for x in (file, fullname, func) if x).lower()
+    if any(marker in text for marker in (
+        "rel4_kernel/src",
+        "/kernel/",
+        "rustlib::",
+        "trap_entry",
+        "c_handle_",
+        "decode_invocation",
+    )):
+        return "kernel"
+    if any(marker in text for marker in (
+        "rust-root-task-demo",
+        "crates/example",
+        "sel4_sys::",
+        "sel4::",
+    )):
+        return "user"
+    if _PRIVILEGE_STATE in ("user", "kernel", "transition"):
+        return _PRIVILEGE_STATE
+    return "unknown"
+
+
+def _privilege_fields(addr=None, file: str = "", fullname: str = "", func: str = ""):
+    privilege = _infer_privilege(addr, file, fullname, func)
+    transition_event = "none"
+    if _PRIVILEGE_TRANSITION_EVENT != "none":
+        if privilege in ("kernel", "transition"):
+            transition_event = _PRIVILEGE_TRANSITION_EVENT
+    return {
+        "privilege": privilege,
+        "transition_event": transition_event,
+    }
+
+
+def _set_privilege_state(privilege: str, transition_event: str = "none",
+                         symbol: str = "", pc=None):
+    global _PRIVILEGE_STATE, _PRIVILEGE_TRANSITION_EVENT
+    global _PRIVILEGE_LAST_SYMBOL, _PRIVILEGE_LAST_PC
+    _PRIVILEGE_STATE = privilege if privilege in ("user", "kernel", "transition", "unknown") else "unknown"
+    _PRIVILEGE_TRANSITION_EVENT = transition_event or "none"
+    _PRIVILEGE_LAST_SYMBOL = symbol or ""
+    if pc is None:
+        _PRIVILEGE_LAST_PC = ""
+    else:
+        try:
+            _PRIVILEGE_LAST_PC = f"{int(pc):#x}"
+        except Exception:
+            _PRIVILEGE_LAST_PC = str(pc)
+
+
+def _set_privilege_group_enabled(group: str):
+    global _PRIVILEGE_ACTIVE_GROUP
+    group = (group or "").strip().lower()
+    if group not in ("user", "kernel", "all", "none"):
+        raise ValueError(f"unsupported privilege breakpoint group: {group}")
+    _PRIVILEGE_ACTIVE_GROUP = group
+
+    for bp_group, bps in _PRIVILEGE_BPS.items():
+        enabled = group == "all" or group == bp_group
+        if group == "none":
+            enabled = False
+        for bp in list(bps):
+            try:
+                if bp.is_valid():
+                    bp.enabled = enabled
+            except Exception:
+                pass
+
+
+def _register_privilege_bp(group: str, bp):
+    group = (group or "").strip().lower()
+    _PRIVILEGE_BPS.setdefault(group, []).append(bp)
+    try:
+        bp.enabled = _PRIVILEGE_ACTIVE_GROUP in ("all", group)
+    except Exception:
+        pass
+
+
+def _clear_privilege_bps():
+    for bps in _PRIVILEGE_BPS.values():
+        for bp in list(bps):
+            try:
+                bp.delete()
+            except Exception:
+                pass
+        bps.clear()
+
+
+def _privilege_hit_label(label: str = "") -> str:
+    if label:
+        return label
+    try:
+        return _current_function_name()
+    except Exception:
+        return "<unknown>"
+
+
+def _record_privilege_hit(group: str, label: str = ""):
+    group = (group or "").strip().lower()
+    symbol = _privilege_hit_label(label)
+    try:
+        pc = _current_pc()
+    except Exception:
+        pc = None
+
+    if group == "user":
+        _set_privilege_state("transition", "user_to_kernel", symbol, pc)
+        _log_ard(f"[ARD][priv] user hit {symbol} pc={_PRIVILEGE_LAST_PC or 'unknown'}")
+        _log_ard("[ARD][priv] transition user -> kernel")
+        _set_privilege_group_enabled("kernel")
+    elif group == "kernel":
+        transition = _PRIVILEGE_TRANSITION_EVENT
+        if transition == "none":
+            transition = "user_to_kernel" if _PRIVILEGE_STATE in ("user", "transition") else "none"
+        _set_privilege_state("kernel", transition, symbol, pc)
+        _log_ard(f"[ARD][priv] kernel hit {symbol} pc={_PRIVILEGE_LAST_PC or 'unknown'}")
+        _set_privilege_group_enabled("kernel")
+
+
+def _record_async_privilege_hit(symbol: str):
+    try:
+        pc = _current_pc()
+    except Exception:
+        pc = None
+    privilege = "kernel" if (pc is not None and _is_kernel_addr(pc)) else "user"
+    transition = _PRIVILEGE_TRANSITION_EVENT
+    if transition == "none" and privilege == "kernel" and _PRIVILEGE_STATE in ("user", "transition"):
+        transition = "user_to_kernel"
+    _set_privilege_state(privilege, transition, symbol, pc)
+    _log_ard(f"[ARD][priv] {privilege} hit {symbol} pc={_PRIVILEGE_LAST_PC or 'unknown'}")
+
+
+def _child_hit_key(tid, parent_cid, parent_sym: str, child_sym: str, child_addr: str):
+    return (
+        tid if tid is not None else "unknown",
+        parent_cid if parent_cid is not None else "unknown",
+        parent_sym or "",
+        child_sym or "",
+        child_addr or "",
+    )
+
+
+def _record_structured_child_hit(tid, parent_cid, parent_sym: str, parent_addr: str,
+                                 child_sym: str, child_addr: str, hit: dict):
+    rec = dict(hit)
+    rec.update({
+        "thread_id": tid,
+        "parent_cid": parent_cid,
+        "parent_symbol": parent_sym or "",
+        "parent_addr": parent_addr or "",
+        "child_symbol": child_sym or hit.get("func", ""),
+        "child_env_addr": child_addr or hit.get("addr", ""),
+    })
+    key = _child_hit_key(tid, parent_cid, parent_sym, child_sym, child_addr)
+    _LAST_CHILD_HIT_BY_STRUCTURED[key] = rec
+
+
+def _find_structured_child_hit(tid, parent_cid, parent_sym: str,
+                               child_sym: str, child_addr: str):
+    key = _child_hit_key(tid, parent_cid, parent_sym, child_sym, child_addr)
+    hit = _LAST_CHILD_HIT_BY_STRUCTURED.get(key)
+    if hit:
+        return hit
+
+    # If the inferred child address is unavailable, still prefer a hit that
+    # agrees on thread, parent CID/symbol, and child symbol.
+    for (k_tid, k_parent_cid, k_parent_sym, k_child_sym, _k_child_addr), rec in _LAST_CHILD_HIT_BY_STRUCTURED.items():
+        if k_tid != (tid if tid is not None else "unknown"):
+            continue
+        if parent_cid is not None and k_parent_cid != parent_cid:
+            continue
+        if parent_sym and k_parent_sym != parent_sym:
+            continue
+        if k_child_sym == child_sym:
+            return rec
+    return None
+
+
+def _find_coro_id_for_symbol_addr(sym: str, addr: str):
+    if not sym or not addr:
+        return None
+    for (poll_sym, this_ptr), cid in _CO_BY_KEY.items():
+        if poll_sym != sym:
+            continue
+        try:
+            if hex(int(this_ptr)) == addr:
+                return cid
+        except Exception:
+            pass
+    return None
+
+
+def _merge_state_info_from_observed(base_info: dict, observed: dict) -> dict:
+    state = observed.get("state")
+    if _is_valid_state_value(state):
+        return _state_info(
+            state,
+            observed.get("state_read_status", "ok"),
+            observed.get("state_read_error", ""),
+        )
+    return base_info
 
 class _PopOnReturnBP(gdb.FinishBreakpoint):
     """Pop coroutine stack when current function returns."""
@@ -165,8 +454,9 @@ _EVENTS_INSTALLED = False
 # Low-level helpers
 # -------------------------
 
-CALL_MNEMONIC_RE = re.compile(r"^\s*(call\w*|bl|blx)\b", re.IGNORECASE)
+CALL_MNEMONIC_RE = re.compile(r"^\s*(call\w*|bl|blx|jal|jalr|c\.jal|c\.jalr|c\.jr|c\.j)\b", re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
+RISCV_CALL_MNEMONIC_RE = re.compile(r"^\s*(call|jal|jalr|c\.jal|c\.jalr|c\.jr|c\.j)\b", re.IGNORECASE)
 
 def _ptr_size() -> int:
     try:
@@ -214,6 +504,19 @@ def _first_arg_reg() -> str:
         return "r0"
 
     return "rdi"
+
+
+def _arch_name_or_empty() -> str:
+    try:
+        return gdb.selected_frame().architecture().name().lower()
+    except Exception:
+        return ""
+
+
+def _riscv_arch_or_unknown() -> bool:
+    arch = _arch_name_or_empty()
+    return (not arch) or ("riscv" in arch)
+
 
 def _current_pc() -> int:
     return int(gdb.parse_and_eval("$pc"))
@@ -355,7 +658,9 @@ def _collect_call_sites() -> list[int]:
         asm = ins.get("asm", "").strip()
         if CALL_MNEMONIC_RE.match(asm):
             _log_ard(f"[ARD] call-detect insn: {asm}")
-            a = int(ins["addr"])
+            a = _normalize_addr(ins["addr"])
+            if a is None:
+                continue
             if a not in seen:
                 out.append(a)
                 seen.add(a)
@@ -371,8 +676,62 @@ def _current_asm() -> str:
             return ins.get("asm", "")
     return gdb.execute("x/i $pc", to_string=True).strip()
 
+
+def _asm_instruction_text(asm: str) -> str:
+    s = (asm or "").strip()
+    s = re.sub(r"^=>\s*", "", s)
+    m = re.match(r"^0x[0-9a-fA-F]+(?:\s+<[^>]*>)?:\s*(.*)$", s)
+    if m:
+        s = m.group(1).strip()
+    if "\t" in s:
+        parts = [p.strip() for p in s.split("\t") if p.strip()]
+        for part in reversed(parts):
+            if RISCV_CALL_MNEMONIC_RE.match(part):
+                return part
+        s = parts[-1] if parts else s
+    s = re.sub(r"^(?:[0-9a-fA-F]{2}\s+)+", "", s).strip()
+    return s
+
+
+def _resolve_riscv_call_target_from_asm(asm: str) -> int | None:
+    s = _asm_instruction_text(asm)
+    m = RISCV_CALL_MNEMONIC_RE.match(s)
+    if not m:
+        return None
+
+    mnemonic = m.group(1).lower()
+    if mnemonic == "call" and not _riscv_arch_or_unknown():
+        return None
+
+    body, _sep, comment = s.partition("#")
+    comment_target = HEX_ADDR_RE.search(comment)
+
+    if mnemonic in ("jalr", "c.jr", "c.jalr"):
+        if comment_target:
+            target = int(comment_target.group(1), 16)
+            _log_ard(f"[ARD] riscv-call-comment-target pc={_current_pc():#x} asm={s} target={target:#x}")
+            return target
+        _log_ard(f"[ARD] riscv-call-indirect-unresolved pc={_current_pc():#x} asm={s} reason=no static target")
+        return None
+
+    if mnemonic == "call" and ("*" in body or "(%" in body):
+        return None
+
+    target_m = HEX_ADDR_RE.search(body)
+    if not target_m:
+        return None
+
+    target = int(target_m.group(1), 16)
+    _log_ard(f"[ARD] riscv-call-direct pc={_current_pc():#x} asm={s} target={target:#x}")
+    return target
+
+
 def _resolve_call_target_from_asm(asm: str) -> int | None:
     s = asm.strip()
+    target = _resolve_riscv_call_target_from_asm(s)
+    if target is not None:
+        return target
+
     # ARM/Thumb: bl/blx immediate
     m = re.search(r"\bblx?\s+0x([0-9a-fA-F]+)", s)
     if m:
@@ -437,78 +796,97 @@ def _pollsym_to_envtype(poll_sym: str) -> str | None:
 
     return None
 
-def _read_env_state(poll_sym: str, this_ptr: int):
+def _read_state_with_status(poll_sym: str, this_ptr: int):
     """
     Read the state discriminant from an async env struct.
 
-    Returns a value suitable for the snapshot 'state' field:
-      - An integer (the raw __state discriminant) if readable
-      - A string like "N/A" if the env type can't be resolved
-      - Falls back to reading the first field of the env struct
-        if __state is not present (e.g. manual Future impls)
+    Returns a dict with state, state_read_status, and state_read_error.
     """
     if not this_ptr:
-        return "N/A"
+        return _state_info("N/A", "unsupported", "missing future pointer")
 
     env_type_name = _pollsym_to_envtype(poll_sym)
     if not env_type_name:
-        return "N/A"
+        return _state_info("N/A", "unsupported", "unsupported poll symbol")
 
     try:
         env_t = gdb.lookup_type(env_type_name)
         env_val = gdb.Value(this_ptr).cast(env_t.pointer()).dereference()
+    except gdb.error as e:
+        return _state_info("N/A", "error", _short_error(e))
+    except Exception as e:
+        return _state_info("N/A", "error", _short_error(e))
 
-        # Primary: try the well-known __state field
-        try:
-            return int(env_val["__state"])
-        except Exception:
-            pass
+    # Primary: try the well-known __state field.
+    try:
+        state = int(env_val["__state"])
+        return _state_info(state, "ok", "")
+    except Exception as e:
+        state_field_error = e
 
-        # Fallback: read the first field as discriminant
-        # (common for manually implemented futures where the first
-        #  field is often a bool or enum indicating completion)
-        try:
-            fields = env_t.fields()
-            if fields:
-                first_val = env_val[fields[0].name]
-                first_code = first_val.type.strip_typedefs().code
-                if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL,
-                                  gdb.TYPE_CODE_ENUM):
-                    return int(first_val)
-        except Exception:
-            pass
+    # Fallback: read the first field as discriminant.
+    try:
+        fields = env_t.fields()
+        if fields:
+            first_name = fields[0].name
+            if not first_name:
+                return _state_info("N/A", "not_found", "missing discriminant field")
+            first_val = env_val[first_name]
+            first_code = first_val.type.strip_typedefs().code
+            if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL,
+                              gdb.TYPE_CODE_ENUM):
+                return _state_info(int(first_val), "ok", "")
+    except gdb.error as e:
+        return _state_info("N/A", "error", _short_error(e))
+    except Exception as e:
+        return _state_info("N/A", "error", _short_error(e))
 
-    except Exception:
-        pass
+    err = _short_error(state_field_error, "missing discriminant field")
+    if "optimized out" in err.lower():
+        return _state_info("N/A", "not_found", err)
+    return _state_info("N/A", "not_found", "missing discriminant field")
 
-    return "N/A"
 
-def _read_env_state_from_value(env_val):
+def _read_env_state(poll_sym: str, this_ptr: int):
+    return _read_state_with_status(poll_sym, this_ptr)["state"]
+
+
+def _read_state_from_value_with_status(env_val):
     """
     Read the state discriminant directly from a GDB value that already
     represents an async env object.
 
-    Returns:
-      - int state discriminant if readable
-      - "N/A" otherwise
+    Returns a dict with state, state_read_status, and state_read_error.
     """
     try:
-        return int(env_val["__state"])
-    except Exception:
-        pass
+        return _state_info(int(env_val["__state"]), "ok", "")
+    except Exception as e:
+        state_field_error = e
 
     try:
         env_t = env_val.type.strip_typedefs()
         fields = env_t.fields()
         if fields:
-            first_val = env_val[fields[0].name]
+            first_name = fields[0].name
+            if not first_name:
+                return _state_info("N/A", "not_found", "missing discriminant field")
+            first_val = env_val[first_name]
             first_code = first_val.type.strip_typedefs().code
             if first_code in (gdb.TYPE_CODE_INT, gdb.TYPE_CODE_BOOL, gdb.TYPE_CODE_ENUM):
-                return int(first_val)
-    except Exception:
-        pass
+                return _state_info(int(first_val), "ok", "")
+    except gdb.error as e:
+        return _state_info("N/A", "error", _short_error(e))
+    except Exception as e:
+        return _state_info("N/A", "error", _short_error(e))
 
-    return "N/A"
+    err = _short_error(state_field_error, "missing discriminant field")
+    if "optimized out" in err.lower():
+        return _state_info("N/A", "not_found", err)
+    return _state_info("N/A", "not_found", "missing discriminant field")
+
+
+def _read_env_state_from_value(env_val):
+    return _read_state_from_value_with_status(env_val)["state"]
 
 def _try_read_env_value_from_frame(frame: gdb.Frame, poll_sym: str):
     """
@@ -1190,6 +1568,7 @@ def _cleanup_run_scoped():
     _LAST_CHILD_HIT_BY_PARENT.clear()
     _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
     _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
+    _LAST_CHILD_HIT_BY_STRUCTURED.clear()
     _CHILD_KEY_MISS_LOGGED.clear()
     global _CO_NEXT_ID
     _CO_NEXT_ID = 1
@@ -1319,6 +1698,12 @@ class PollEntryBP(gdb.Breakpoint):
             seq = _CO_POLL_SEQ.get(cid, 0) + 1
             _CO_POLL_SEQ[cid] = seq
             _log_diag(f"[ARD][diag] poll sequence updated: cid={cid} seq={seq}")
+        state_info = (
+            _read_state_with_status(poll_sym, this_ptr)
+            if cid and this_ptr
+            else _state_info("N/A", "unsupported", "missing future pointer")
+        )
+        _record_async_privilege_hit(poll_sym)
         if cid and this_ptr:
             addr_hex = hex(this_ptr)
             _LAST_CHILD_HIT_BY_FUNC_ADDR[(poll_sym, addr_hex)] = {
@@ -1326,7 +1711,7 @@ class PollEntryBP(gdb.Breakpoint):
                 "cid": cid,
                 "poll": seq,
                 "addr": addr_hex,
-                "state": _read_env_state(poll_sym, this_ptr),
+                **_state_fields(state_info),
             }
             _log_diag(
                 f"[ARD][diag] node cache updated: poll_sym={poll_sym!r} cid={cid} addr={addr_hex}"
@@ -1336,18 +1721,30 @@ class PollEntryBP(gdb.Breakpoint):
             st = _TLS_STACK.get(tid, [])
             if cid and len(st) >= 2:
                 parent_cid = st[-2]
-                parent_sym, _parent_ptr = _CO_META.get(parent_cid, ("", 0))
+                parent_sym, parent_ptr = _CO_META.get(parent_cid, ("", 0))
                 if parent_sym:
-                    _LAST_CHILD_HIT_BY_PARENT[parent_sym] = {
+                    child_addr = hex(this_ptr) if this_ptr else ""
+                    hit = {
                         "func": poll_sym,
                         "cid": cid,
                         "poll": seq,
-                        "addr": hex(this_ptr) if this_ptr else "",
-                        "state": _read_env_state(poll_sym, this_ptr) if this_ptr else "N/A",
+                        "addr": child_addr,
+                        **_state_fields(state_info),
                     }
-                    _log_ard(
-                        f"[ARD] child-hit parent={parent_sym} child={poll_sym} cid={cid} poll={seq} addr={hex(this_ptr) if this_ptr else '0x0'}"
+                    _LAST_CHILD_HIT_BY_PARENT[parent_sym] = hit
+                    _record_structured_child_hit(
+                        tid,
+                        parent_cid,
+                        parent_sym,
+                        hex(parent_ptr) if parent_ptr else "",
+                        poll_sym,
+                        child_addr,
+                        hit,
                     )
+                    _log_ard(
+                        f"[ARD] child-hit parent={parent_sym} parent_cid={parent_cid} child={poll_sym} cid={cid} poll={seq} addr={child_addr or '0x0'}"
+                    )
+                    _log_ard(f"[ARD][async] {parent_sym} -> {poll_sym}")
         except Exception:
             pass
                 # Also record the most relevant async caller frame name from the physical stack.
@@ -1363,15 +1760,35 @@ class PollEntryBP(gdb.Breakpoint):
                 caller_frame = caller_frame.older()
 
             if cid and caller_async_name:
-                _LAST_CHILD_HIT_BY_CALLER_FRAME[caller_async_name] = {
+                child_addr = hex(this_ptr) if this_ptr else ""
+                caller_cid = None
+                try:
+                    for stack_cid in reversed(_TLS_STACK.get(tid, [])):
+                        stack_sym, _stack_ptr = _CO_META.get(stack_cid, ("", 0))
+                        if stack_sym == caller_async_name:
+                            caller_cid = stack_cid
+                            break
+                except Exception:
+                    caller_cid = None
+                hit = {
                     "func": poll_sym,
                     "cid": cid,
                     "poll": seq,
-                    "addr": hex(this_ptr) if this_ptr else "",
-                    "state": _read_env_state(poll_sym, this_ptr) if this_ptr else "N/A",
+                    "addr": child_addr,
+                    **_state_fields(state_info),
                 }
+                _LAST_CHILD_HIT_BY_CALLER_FRAME[caller_async_name] = hit
+                _record_structured_child_hit(
+                    tid,
+                    caller_cid,
+                    caller_async_name,
+                    "",
+                    poll_sym,
+                    child_addr,
+                    hit,
+                )
                 _log_ard(
-                    f"[ARD] caller-frame-hit caller={caller_async_name} child={poll_sym} cid={cid} poll={seq} addr={hex(this_ptr) if this_ptr else '0x0'}"
+                    f"[ARD] caller-frame-hit caller={caller_async_name} caller_cid={caller_cid} child={poll_sym} cid={cid} poll={seq} addr={child_addr or '0x0'}"
                 )
         except Exception:
             pass
@@ -1411,7 +1828,10 @@ class PollEntryBP(gdb.Breakpoint):
                 return False
 
             for a in call_sites:
-                CallSiteBP(a)
+                try:
+                    CallSiteBP(a)
+                except Exception as e:
+                    _log_ard(f"[ARD]{indent} call-site bp install failed addr={a:#x}: {_short_error(e)}")
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
@@ -1450,7 +1870,25 @@ class CallSiteBP(gdb.Breakpoint):
             PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
 
         return False
-    
+
+
+class PrivilegeGroupBP(gdb.Breakpoint):
+    def __init__(self, group: str, location: str, label: str = ""):
+        self.group = (group or "").strip().lower()
+        if self.group not in ("user", "kernel"):
+            raise ValueError("privilege breakpoint group must be user or kernel")
+        super().__init__(location, type=gdb.BP_BREAKPOINT, internal=True)
+        self.silent = True
+        self.location_text = location
+        self.label = label or location
+        _CREATED_BPS.append(self)
+        _RUN_SCOPED_BPS.append(self)
+        _register_privilege_bp(self.group, self)
+
+    def stop(self) -> bool:
+        _record_privilege_hit(self.group, self.label)
+        return False
+
 # -------------------------
 # Commands
 # -------------------------
@@ -1482,6 +1920,98 @@ class ARDTraceCommand(gdb.Command):
         gdb.write(f"[ARD] trace root: {sym}\n")
 
 
+class ARDPrivAddCommand(gdb.Command):
+    """
+    Add a breakpoint to a privilege breakpoint group.
+    Usage: ardb-priv-add <user|kernel> <location> [label]
+    Example: ardb-priv-add user *0x27d7a seL4_Uint_Notification_register_async_syscall
+    """
+    def __init__(self):
+        super().__init__("ardb-priv-add", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        try:
+            parts = gdb.string_to_argv(arg)
+        except Exception:
+            parts = arg.split()
+        if len(parts) < 2:
+            gdb.write("Usage: ardb-priv-add <user|kernel> <location> [label]\n")
+            return
+
+        group = parts[0].strip().lower()
+        location = parts[1].strip()
+        label = " ".join(parts[2:]).strip() if len(parts) > 2 else location
+        if group not in ("user", "kernel"):
+            gdb.write("[ARD][priv] group must be user or kernel\n")
+            return
+
+        try:
+            bp = PrivilegeGroupBP(group, location, label)
+        except Exception as e:
+            gdb.write(f"[ARD][priv] failed to add {group} breakpoint {location}: {e}\n")
+            return
+        gdb.write(
+            f"[ARD][priv] added {group} breakpoint #{bp.number} {location} label={label} enabled={bp.enabled}\n"
+        )
+
+
+class ARDPrivEnableCommand(gdb.Command):
+    """
+    Enable one privilege breakpoint group.
+    Usage: ardb-priv-enable <user|kernel|all|none>
+    """
+    def __init__(self):
+        super().__init__("ardb-priv-enable", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        group = (arg or "").strip().lower()
+        if not group:
+            group = "user"
+        try:
+            _set_privilege_group_enabled(group)
+        except Exception as e:
+            gdb.write(f"[ARD][priv] failed to enable group: {e}\n")
+            return
+        gdb.write(f"[ARD][priv] active breakpoint group: {_PRIVILEGE_ACTIVE_GROUP}\n")
+
+
+class ARDPrivResetCommand(gdb.Command):
+    """
+    Delete privilege breakpoint groups and reset privilege state.
+    Usage: ardb-priv-reset
+    """
+    def __init__(self):
+        super().__init__("ardb-priv-reset", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _PRIVILEGE_ACTIVE_GROUP
+        _clear_privilege_bps()
+        _PRIVILEGE_BPS["user"].clear()
+        _PRIVILEGE_BPS["kernel"].clear()
+        _PRIVILEGE_ACTIVE_GROUP = "user"
+        _set_privilege_state("unknown", "none")
+        gdb.write("[ARD][priv] reset done.\n")
+
+
+class ARDPrivStatusCommand(gdb.Command):
+    """
+    Print current privilege state and breakpoint group counts.
+    Usage: ardb-priv-status
+    """
+    def __init__(self):
+        super().__init__("ardb-priv-status", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        gdb.write(
+            "[ARD][priv] "
+            f"state={_PRIVILEGE_STATE} transition={_PRIVILEGE_TRANSITION_EVENT} "
+            f"symbol={_PRIVILEGE_LAST_SYMBOL or ''} pc={_PRIVILEGE_LAST_PC or ''} "
+            f"active_group={_PRIVILEGE_ACTIVE_GROUP} "
+            f"user_bps={len(_PRIVILEGE_BPS.get('user', []))} "
+            f"kernel_bps={len(_PRIVILEGE_BPS.get('kernel', []))}\n"
+        )
+
+
 class ARDResetCommand(gdb.Command):
     def __init__(self):
         super().__init__("ardb-reset", gdb.COMMAND_USER)
@@ -1507,7 +2037,14 @@ class ARDResetCommand(gdb.Command):
         _LAST_CHILD_HIT_BY_PARENT.clear()
         _LAST_CHILD_HIT_BY_CALLER_FRAME.clear()
         _LAST_CHILD_HIT_BY_FUNC_ADDR.clear()
+        _LAST_CHILD_HIT_BY_STRUCTURED.clear()
         _CHILD_KEY_MISS_LOGGED.clear()
+        _clear_privilege_bps()
+        _PRIVILEGE_BPS["user"].clear()
+        _PRIVILEGE_BPS["kernel"].clear()
+        global _PRIVILEGE_ACTIVE_GROUP
+        _PRIVILEGE_ACTIVE_GROUP = "user"
+        _set_privilege_state("unknown", "none")
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
@@ -1591,6 +2128,10 @@ class ARDGetSnapshotCommand(gdb.Command):
         
         snapshot = {
             "thread_id": tid,
+            "privilege": _PRIVILEGE_STATE,
+            "transition_event": _PRIVILEGE_TRANSITION_EVENT,
+            "transition_symbol": _PRIVILEGE_LAST_SYMBOL,
+            "transition_pc": _PRIVILEGE_LAST_PC,
             "path": []
         }
         
@@ -1603,7 +2144,7 @@ class ARDGetSnapshotCommand(gdb.Command):
 
             node_type = "async" if _is_async_symbol(poll_sym) else "sync"
 
-            state_val = _read_env_state(poll_sym, this_ptr)
+            state_info = _read_state_with_status(poll_sym, this_ptr)
 
             # Try to get source location for this async function
             async_file = ""
@@ -1626,7 +2167,9 @@ class ARDGetSnapshotCommand(gdb.Command):
                 "func": poll_sym,
                 "addr": hex(this_ptr),
                 "poll": seq,
-                "state": state_val,
+                **_state_fields(state_info),
+                **_child_hit_fields(),
+                **_privilege_fields(hex(this_ptr), async_file, async_fullname, poll_sym),
                 "origin": "trace",
                 "file": async_file,
                 "fullname": async_fullname,
@@ -1685,14 +2228,14 @@ class ARDGetSnapshotCommand(gdb.Command):
 
                     node_cid = None
                     node_poll = 0
-                    node_state = "NON-ASYNC"
+                    node_state_info = _state_info("NON-ASYNC", "unsupported", "non-async frame")
                     node_addr = hex(frame.pc())
 
                     if frame_type == "async":
                         # For async frames, try to read the env ptr from the
                         # frame's debug info (first argument / self).
                         # $rdi is unreliable for non-entry frames.
-                        node_state = "N/A"
+                        node_state_info = _state_info("N/A", "unsupported", "missing future pointer")
                         this_ptr = 0
                         env_val = None
 
@@ -1725,7 +2268,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                                 frame.select()
                                 env_val = _try_read_env_value_from_frame(frame, fname)
                                 if env_val is not None:
-                                    node_state = _read_env_state_from_value(env_val)
+                                    node_state_info = _read_state_from_value_with_status(env_val)
                             except Exception:
                                 pass
 
@@ -1746,7 +2289,7 @@ class ARDGetSnapshotCommand(gdb.Command):
                                     node_cid = cid_phys
                                     node_poll = _CO_POLL_SEQ.get(cid_phys, 0)
                                     node_addr = hex(this_ptr)
-                                    node_state = _read_env_state(fname, this_ptr)
+                                    node_state_info = _read_state_with_status(fname, this_ptr)
                             except Exception:
                                 pass
 
@@ -1764,43 +2307,109 @@ class ARDGetSnapshotCommand(gdb.Command):
 
                             if awaitee_type and awaitee_type != outer_env_type:
                                 awaitee_state = _value_state_name(local_awaitee)
+                                awaitee_state_info = (
+                                    _state_info(awaitee_state, "ok", "")
+                                    if _is_valid_state_value(awaitee_state)
+                                    else _state_info("N/A", "unsupported", "no runtime future object")
+                                )
                                 awaitee_poll_sym = _child_poll_symbol_from_awaitee_type(awaitee_type)
                                 leaf_func = awaitee_poll_sym or awaitee_type
 
                                 leaf_cid = None
                                 leaf_poll = 0
                                 leaf_addr = f"{node_addr}::awaitee::{leaf_func}"
-                                leaf_state = awaitee_state
+                                leaf_state_info = awaitee_state_info
                                 leaf_origin = "inferred"
+                                child_env_addr = ""
+                                try:
+                                    inferred_child_ptr = _extract_raw_ptr(local_awaitee)
+                                    if inferred_child_ptr:
+                                        child_env_addr = hex(inferred_child_ptr)
+                                except Exception:
+                                    child_env_addr = ""
+                                parent_cid_for_hit = (
+                                    node_cid
+                                    if node_cid is not None
+                                    else _find_coro_id_for_symbol_addr(fname, node_addr)
+                                )
+                                child_hit = _child_hit_fields(
+                                    "miss",
+                                    tid,
+                                    parent_cid_for_hit,
+                                    fname,
+                                    leaf_func,
+                                    child_env_addr,
+                                )
 
-                                observed = (
-                                    _LAST_CHILD_HIT_BY_CALLER_FRAME.get(fname)
-                                    or _LAST_CHILD_HIT_BY_PARENT.get(fname)
+                                observed = _find_structured_child_hit(
+                                    tid,
+                                    parent_cid_for_hit,
+                                    fname,
+                                    leaf_func,
+                                    child_env_addr,
                                 )
                                 if observed and observed.get("func") == leaf_func:
                                     leaf_cid = observed.get("cid")
                                     leaf_poll = observed.get("poll", 0)
                                     leaf_addr = observed.get("addr") or leaf_addr
-                                    leaf_state = observed.get("state") or leaf_state
+                                    leaf_state_info = _merge_state_info_from_observed(leaf_state_info, observed)
                                     leaf_origin = "trace-upgraded"
+                                    child_hit = _child_hit_fields(
+                                        "structured",
+                                        observed.get("thread_id", tid),
+                                        observed.get("parent_cid", parent_cid_for_hit),
+                                        observed.get("parent_symbol", fname),
+                                        observed.get("child_symbol", leaf_func),
+                                        observed.get("child_env_addr") or observed.get("addr") or child_env_addr,
+                                    )
                                     _log_ard(
-                                        f"[ARD] snapshot-upgrade parent={fname} child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
+                                        f"[ARD] snapshot-upgrade structured parent={fname} child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
                                     )
                                 else:
-                                    observed_by_key = _LAST_CHILD_HIT_BY_FUNC_ADDR.get((leaf_func, node_addr))
-                                    if observed_by_key:
-                                        leaf_cid = observed_by_key.get("cid")
-                                        leaf_poll = observed_by_key.get("poll", 0)
-                                        leaf_addr = observed_by_key.get("addr") or leaf_addr
-                                        leaf_state = observed_by_key.get("state") or leaf_state
+                                    observed = (
+                                        _LAST_CHILD_HIT_BY_CALLER_FRAME.get(fname)
+                                        or _LAST_CHILD_HIT_BY_PARENT.get(fname)
+                                    )
+                                    if observed and observed.get("func") == leaf_func:
+                                        leaf_cid = observed.get("cid")
+                                        leaf_poll = observed.get("poll", 0)
+                                        leaf_addr = observed.get("addr") or leaf_addr
+                                        leaf_state_info = _merge_state_info_from_observed(leaf_state_info, observed)
                                         leaf_origin = "trace-upgraded"
-                                        _log_ard(
-                                            f"[ARD] snapshot-upgrade-by-child-key child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
+                                        child_hit = _child_hit_fields(
+                                            "legacy_fallback",
+                                            tid,
+                                            parent_cid_for_hit,
+                                            fname,
+                                            leaf_func,
+                                            observed.get("addr") or child_env_addr,
                                         )
-                                    elif _should_log_child_key_miss(leaf_func, node_addr):
                                         _log_ard(
-                                            f"[ARD] snapshot-upgrade-by-child-key miss child={leaf_func} node_addr={node_addr}"
+                                            f"[ARD] snapshot-upgrade legacy parent={fname} child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
                                         )
+                                    else:
+                                        observed_by_key = _LAST_CHILD_HIT_BY_FUNC_ADDR.get((leaf_func, node_addr))
+                                        if observed_by_key:
+                                            leaf_cid = observed_by_key.get("cid")
+                                            leaf_poll = observed_by_key.get("poll", 0)
+                                            leaf_addr = observed_by_key.get("addr") or leaf_addr
+                                            leaf_state_info = _merge_state_info_from_observed(leaf_state_info, observed_by_key)
+                                            leaf_origin = "trace-upgraded"
+                                            child_hit = _child_hit_fields(
+                                                "legacy_fallback",
+                                                tid,
+                                                parent_cid_for_hit,
+                                                fname,
+                                                leaf_func,
+                                                observed_by_key.get("addr") or child_env_addr,
+                                            )
+                                            _log_ard(
+                                                f"[ARD] snapshot-upgrade-by-child-key fallback child={leaf_func} cid={leaf_cid} poll={leaf_poll} addr={leaf_addr}"
+                                            )
+                                        elif _should_log_child_key_miss(leaf_func, node_addr):
+                                            _log_ard(
+                                                f"[ARD] snapshot-upgrade miss child={leaf_func} parent={fname} parent_cid={parent_cid_for_hit} child_addr={child_env_addr} node_addr={node_addr}"
+                                            )
 
                                 # If the next real async frame is already this same child poll,
                                 # do not also append an inferred awaitee leaf.
@@ -1819,7 +2428,9 @@ class ARDGetSnapshotCommand(gdb.Command):
                                         "func": leaf_func,
                                         "addr": leaf_addr,
                                         "poll": leaf_poll,
-                                        "state": leaf_state,
+                                        **_state_fields(leaf_state_info),
+                                        **child_hit,
+                                        **_privilege_fields(leaf_addr, phys_file, phys_fullname, leaf_func),
                                         "origin": leaf_origin,
                                         "file": phys_file,
                                         "fullname": phys_fullname,
@@ -1842,7 +2453,9 @@ class ARDGetSnapshotCommand(gdb.Command):
                         "func": fname,
                         "addr": node_addr,
                         "poll": node_poll,
-                        "state": node_state,
+                        **_state_fields(node_state_info),
+                        **_child_hit_fields(),
+                        **_privilege_fields(node_addr, phys_file, phys_fullname, fname),
                         "origin": "physical",
                         "file": phys_file,
                         "fullname": phys_fullname,
@@ -2035,6 +2648,10 @@ def install():
     gdb.execute("set debuginfod enabled off", to_string=True)
 
     ARDTraceCommand()
+    ARDPrivAddCommand()
+    ARDPrivEnableCommand()
+    ARDPrivResetCommand()
+    ARDPrivStatusCommand()
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
@@ -2054,4 +2671,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status\n")

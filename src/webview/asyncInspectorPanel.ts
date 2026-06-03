@@ -497,6 +497,19 @@ export class AsyncInspectorPanel {
         return typeof origin === 'string' && origin ? origin : undefined;
     }
 
+    private copySnapshotMetadata(target: TreeNode, source: SnapshotData['path'][0]): void {
+        target.state_read_status = source.state_read_status;
+        target.state_read_error = source.state_read_error;
+        target.child_hit_match = source.child_hit_match;
+        target.child_hit_thread_id = source.child_hit_thread_id;
+        target.child_hit_parent_cid = source.child_hit_parent_cid;
+        target.child_hit_parent_symbol = source.child_hit_parent_symbol;
+        target.child_hit_child_symbol = source.child_hit_child_symbol;
+        target.child_hit_env_addr = source.child_hit_env_addr;
+        target.privilege = source.privilege;
+        target.transition_event = source.transition_event;
+    }
+
     private updateTreeFromSnapshot(snapshot: SnapshotData): void {
         if (snapshot.path.length === 0) {
             return;
@@ -543,6 +556,7 @@ export class AsyncInspectorPanel {
             root.fullname = rootNode.fullname;
             root.line = rootNode.line;
         }
+        this.copySnapshotMetadata(root, rootNode);
 
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
     }
@@ -590,6 +604,7 @@ export class AsyncInspectorPanel {
                             placeholder.file = node.file;
                             placeholder.fullname = node.fullname;
                             placeholder.line = node.line;
+                            this.copySnapshotMetadata(placeholder, node);
                             child = placeholder;
                         }
                     }
@@ -628,6 +643,7 @@ export class AsyncInspectorPanel {
                     fullname: node.fullname,
                     line: node.line,
                 };
+                this.copySnapshotMetadata(nextChild, node);
 
                 if (!child) {
                     current.children.push(nextChild);
@@ -639,6 +655,7 @@ export class AsyncInspectorPanel {
                     nextChild.file = node.file;
                     nextChild.fullname = node.fullname;
                     nextChild.line = node.line;
+                    this.copySnapshotMetadata(nextChild, node);
                 }
 
                 current = nextChild;
@@ -658,11 +675,13 @@ export class AsyncInspectorPanel {
                         origin: this.getSnapshotNodeOrigin(node),
                         children: [],
                     };
+                    this.copySnapshotMetadata(syncChild, node);
                     current.children.push(syncChild);
                 } else {
                     existing.origin = this.getSnapshotNodeOrigin(node);
+                    this.copySnapshotMetadata(existing, node);
                 }
-            }else if (node.type === 'sync') {
+            } else if (node.type === 'sync') {
                 // Dedup sync nodes by func + addr
                 const existing = current.children.find(
                     c => c.type === 'sync' && c.func === node.func && c.addr === node.addr
@@ -678,6 +697,7 @@ export class AsyncInspectorPanel {
                         origin: this.getSnapshotNodeOrigin(node),
                         children: [],
                     };
+                    this.copySnapshotMetadata(syncChild, node);
                     current.children.push(syncChild);
                     // Sync nodes are leaf-like, don't descend into them
                 }
@@ -832,6 +852,16 @@ interface TreeNode {
     addr: string;
     poll: number;
     state: number | string;
+    state_read_status?: string;
+    state_read_error?: string;
+    child_hit_match?: string;
+    child_hit_thread_id?: number | string | null;
+    child_hit_parent_cid?: number | string | null;
+    child_hit_parent_symbol?: string;
+    child_hit_child_symbol?: string;
+    child_hit_env_addr?: string;
+    privilege?: string;
+    transition_event?: string;
     origin?: string;
     file?: string;
     fullname?: string;

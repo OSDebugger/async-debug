@@ -447,7 +447,27 @@ function handleStackTrace(request: any): void {
  * Parse a snapshot JSON from GDB console output.
  * Returns the parsed snapshot or undefined if parsing fails.
  */
-function parseSnapshot(output: string): { thread_id: number; path: Array<{ type: string; cid: number | null; func: string; addr: string; poll: number; state: number | string; file?: string; fullname?: string; line?: number }> } | undefined {
+function parseSnapshot(output: string): {
+    thread_id: number;
+    privilege?: string;
+    transition_event?: string;
+    path: Array<{
+        type: string;
+        cid: number | null;
+        func: string;
+        addr: string;
+        poll: number;
+        state: number | string;
+        state_read_status?: string;
+        state_read_error?: string;
+        child_hit_match?: string;
+        privilege?: string;
+        transition_event?: string;
+        file?: string;
+        fullname?: string;
+        line?: number;
+    }>;
+} | undefined {
     if (!output) return undefined;
 
     const jsonStart = output.indexOf('{');

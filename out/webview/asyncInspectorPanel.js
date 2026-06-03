@@ -438,6 +438,18 @@ class AsyncInspectorPanel {
         const origin = node.origin;
         return typeof origin === 'string' && origin ? origin : undefined;
     }
+    copySnapshotMetadata(target, source) {
+        target.state_read_status = source.state_read_status;
+        target.state_read_error = source.state_read_error;
+        target.child_hit_match = source.child_hit_match;
+        target.child_hit_thread_id = source.child_hit_thread_id;
+        target.child_hit_parent_cid = source.child_hit_parent_cid;
+        target.child_hit_parent_symbol = source.child_hit_parent_symbol;
+        target.child_hit_child_symbol = source.child_hit_child_symbol;
+        target.child_hit_env_addr = source.child_hit_env_addr;
+        target.privilege = source.privilege;
+        target.transition_event = source.transition_event;
+    }
     updateTreeFromSnapshot(snapshot) {
         if (snapshot.path.length === 0) {
             return;
@@ -481,6 +493,7 @@ class AsyncInspectorPanel {
             root.fullname = rootNode.fullname;
             root.line = rootNode.line;
         }
+        this.copySnapshotMetadata(root, rootNode);
         this.mergePathIntoTree(root, snapshot.path, rootIndex + 1);
     }
     /**
@@ -513,6 +526,7 @@ class AsyncInspectorPanel {
                             placeholder.file = node.file;
                             placeholder.fullname = node.fullname;
                             placeholder.line = node.line;
+                            this.copySnapshotMetadata(placeholder, node);
                             child = placeholder;
                         }
                     }
@@ -542,6 +556,7 @@ class AsyncInspectorPanel {
                     fullname: node.fullname,
                     line: node.line,
                 };
+                this.copySnapshotMetadata(nextChild, node);
                 if (!child) {
                     current.children.push(nextChild);
                 }
@@ -553,6 +568,7 @@ class AsyncInspectorPanel {
                     nextChild.file = node.file;
                     nextChild.fullname = node.fullname;
                     nextChild.line = node.line;
+                    this.copySnapshotMetadata(nextChild, node);
                 }
                 current = nextChild;
             }
@@ -570,10 +586,12 @@ class AsyncInspectorPanel {
                         origin: this.getSnapshotNodeOrigin(node),
                         children: [],
                     };
+                    this.copySnapshotMetadata(syncChild, node);
                     current.children.push(syncChild);
                 }
                 else {
                     existing.origin = this.getSnapshotNodeOrigin(node);
+                    this.copySnapshotMetadata(existing, node);
                 }
             }
             else if (node.type === 'sync') {
@@ -590,6 +608,7 @@ class AsyncInspectorPanel {
                         origin: this.getSnapshotNodeOrigin(node),
                         children: [],
                     };
+                    this.copySnapshotMetadata(syncChild, node);
                     current.children.push(syncChild);
                     // Sync nodes are leaf-like, don't descend into them
                 }

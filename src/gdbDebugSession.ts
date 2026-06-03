@@ -8,6 +8,10 @@ import * as fs from 'fs';
  */
 export interface SnapshotData {
     thread_id: number;
+    privilege?: string;
+    transition_event?: string;
+    transition_symbol?: string;
+    transition_pc?: string;
     path: Array<{
         type: 'async' | 'sync';
         cid: number | null;
@@ -15,6 +19,16 @@ export interface SnapshotData {
         addr: string;
         poll: number;
         state: number | string;
+        state_read_status?: string;
+        state_read_error?: string;
+        child_hit_match?: string;
+        child_hit_thread_id?: number | string | null;
+        child_hit_parent_cid?: number | string | null;
+        child_hit_parent_symbol?: string;
+        child_hit_child_symbol?: string;
+        child_hit_env_addr?: string;
+        privilege?: 'user' | 'kernel' | 'transition' | 'unknown' | string;
+        transition_event?: 'user_to_kernel' | 'kernel_to_user' | 'none' | string;
         origin?: "trace" | "physical" | "inferred" | "trace-upgraded" | string;
         file?: string;
         fullname?: string;
