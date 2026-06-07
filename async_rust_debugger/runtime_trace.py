@@ -70,6 +70,9 @@ _PRIVILEGE_BPS = {
     "user": [],
     "kernel": [],
 }
+_TRANSITION_PATH = []
+_TRANSITION_SEQ = 0
+_REL4_TRANSITION_PROBE_BPS = []
 
 def _thread_id() -> int:
     t = gdb.selected_thread()
@@ -327,6 +330,251 @@ def _record_async_privilege_hit(symbol: str):
         transition = "user_to_kernel"
     _set_privilege_state(privilege, transition, symbol, pc)
     _log_ard(f"[ARD][priv] {privilege} hit {symbol} pc={_PRIVILEGE_LAST_PC or 'unknown'}")
+
+
+def _frame_source_fields():
+    file = ""
+    fullname = ""
+    line = 0
+    try:
+        frame = gdb.selected_frame()
+        sal = frame.find_sal()
+        if sal and sal.symtab:
+            file = sal.symtab.filename or ""
+            try:
+                fullname = sal.symtab.fullname()
+            except Exception:
+                fullname = file
+            line = int(sal.line or 0)
+    except Exception:
+        pass
+    return file, fullname, line
+
+
+def _pc_hex(pc=None) -> str:
+    if pc is None:
+        try:
+            pc = _current_pc()
+        except Exception:
+            return ""
+    try:
+        return f"{int(pc):#x}"
+    except Exception:
+        return str(pc) if pc is not None else ""
+
+
+def _reset_transition_path():
+    global _TRANSITION_PATH, _TRANSITION_SEQ
+    _TRANSITION_PATH = []
+    _TRANSITION_SEQ = 0
+
+
+def _record_transition_node(node_type: str, privilege: str, label: str,
+                            func: str = "", pc=None, file: str = "",
+                            fullname: str = "", line=None, event: str = ""):
+    global _TRANSITION_SEQ
+    node_type = (node_type or "sync").strip().lower()
+    privilege = (privilege or "unknown").strip().lower()
+    label = (label or "").strip()
+    func = (func or "").strip()
+    event = (event or "").strip()
+
+    if node_type not in ("sync", "transition", "async"):
+        node_type = "sync"
+    if privilege not in ("user", "kernel", "transition", "unknown"):
+        privilege = "unknown"
+
+    if not file and not fullname:
+        auto_file, auto_fullname, auto_line = _frame_source_fields()
+        file = auto_file
+        fullname = auto_fullname
+        if line in (None, "", 0, "0"):
+            line = auto_line
+
+    if not func and node_type != "transition":
+        try:
+            func = _current_function_name()
+        except Exception:
+            func = ""
+
+    try:
+        line_value = int(line) if line not in (None, "") else 0
+    except Exception:
+        line_value = 0
+
+    _TRANSITION_SEQ += 1
+    node = {
+        "seq": _TRANSITION_SEQ,
+        "type": node_type,
+        "privilege": privilege,
+        "label": label or event or func or node_type,
+    }
+    if func:
+        node["func"] = func
+    if event:
+        node["event"] = event
+    pc_text = _pc_hex(pc)
+    if pc_text:
+        node["pc"] = pc_text
+    if file:
+        node["file"] = file
+    if fullname:
+        node["fullname"] = fullname
+    if line_value:
+        node["line"] = line_value
+
+    _TRANSITION_PATH.append(node)
+    _log_ard(
+        f"[ARD][transition] add seq={node['seq']} type={node_type} privilege={privilege} "
+        f"label={node['label']} func={func or ''} event={event or ''} pc={pc_text or ''}"
+    )
+    return node
+
+
+def _record_transition_event(event: str):
+    event = (event or "unknown").strip()
+    _set_privilege_state("transition", event)
+    return _record_transition_node(
+        "transition",
+        "transition",
+        event,
+        event=event,
+        pc="",
+        file="",
+        fullname="",
+        line=0,
+    )
+
+
+def _get_transition_path_snapshot():
+    return [dict(node) for node in _TRANSITION_PATH]
+
+
+def _rel4_env(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default or "").strip()
+
+
+def _rel4_addr_location(env_name: str, default_addr: str) -> str:
+    value = _rel4_env(env_name, default_addr)
+    if not value:
+        return ""
+    return value if value.startswith("*") else f"*{value}"
+
+
+def _rel4_probe_source_paths():
+    user_fullname = _rel4_env(
+        "REL4_ROOT_TASK_SRC",
+        "/home/user/AsyncOS/rel4-manifest-workspace/projects/rust-root-task-demo/crates/example/src/syscall_test.rs",
+    )
+    kernel_fullname = _rel4_env(
+        "REL4_KERNEL_SRC",
+        "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/src/syscall/invocation/decode/mod.rs",
+    )
+    return user_fullname, kernel_fullname
+
+
+def _rel4_warn_missing_path(path: str):
+    if path and not os.path.exists(path):
+        gdb.write(f"[ARD][rel4-chain] warning: source path not found: {path}\n")
+
+
+def _rel4_transition_probe_specs():
+    user_fullname, kernel_fullname = _rel4_probe_source_paths()
+    user_file = "crates/example/src/syscall_test.rs"
+    kernel_file = "src/syscall/invocation/decode/mod.rs"
+
+    return [
+        {
+            "location": _rel4_addr_location("REL4_USER_START_ADDR", "0x1c580"),
+            "node_type": "sync",
+            "privilege": "user",
+            "label": "syscall_test.rs:81",
+            "func": "example::syscall_test::async_syscall_test",
+            "file": user_file,
+            "fullname": user_fullname,
+            "line": 81,
+            "message": "[1] [USER] syscall_test.rs:81",
+        },
+        {
+            "location": _rel4_addr_location("REL4_USER_REGISTER_ADDR", "0x1c626"),
+            "node_type": "sync",
+            "privilege": "user",
+            "label": "syscall_test.rs:99/101",
+            "func": "example::syscall_test::async_syscall_test",
+            "file": user_file,
+            "fullname": user_fullname,
+            "line": 101,
+            "message": "[2] [USER] syscall_test.rs:99/101",
+        },
+        {
+            "location": _rel4_addr_location("REL4_USER_WRAPPER_ADDR", "0x27d7a"),
+            "node_type": "sync",
+            "privilege": "user",
+            "label": "syscall wrapper",
+            "func": "seL4_Uint_Notification_register_async_syscall",
+            "file": "",
+            "fullname": _rel4_env("REL4_USER_WRAPPER_SRC", ""),
+            "line": _rel4_env("REL4_USER_WRAPPER_LINE", "699"),
+            "message": "[3] [USER] syscall wrapper",
+        },
+        {
+            "location": _rel4_addr_location("REL4_KERNEL_LABEL33_ADDR", "0xffffffff84017ff8"),
+            "event": "user_to_kernel",
+            "node_type": "sync",
+            "privilege": "kernel",
+            "label": "UintrRegisterAsyncSyscall label 33 / decode_invocation",
+            "func": "rustlib::syscall::invocation::decode::decode_invocation",
+            "file": kernel_file,
+            "fullname": kernel_fullname,
+            "line": 93,
+            "message": "[5] [KERNEL] UintrRegisterAsyncSyscall label 33 / decode_invocation",
+            "event_message": "[4] [TRANSITION] user_to_kernel",
+        },
+        {
+            "location": _rel4_addr_location("REL4_KERNEL_SPAWN_ADDR", "0xffffffff84018042"),
+            "node_type": "sync",
+            "privilege": "kernel",
+            "label": "async_syscall_handler spawn site",
+            "func": "rustlib::syscall::invocation::decode::decode_invocation",
+            "file": kernel_file,
+            "fullname": kernel_fullname,
+            "line": 100,
+            "message": "[6] [KERNEL] async_syscall_handler spawn site",
+        },
+    ]
+
+
+def _rel4_set_privilege_for_spec(spec: dict):
+    privilege = (spec.get("privilege") or "unknown").strip().lower()
+    label = spec.get("label") or spec.get("func") or ""
+    try:
+        pc = _current_pc()
+    except Exception:
+        pc = None
+    if privilege == "user":
+        _set_privilege_state("user", "none", label, pc)
+    elif privilege == "kernel":
+        transition = _PRIVILEGE_TRANSITION_EVENT
+        if transition == "none":
+            transition = "user_to_kernel" if _PRIVILEGE_STATE in ("user", "transition") else "none"
+        _set_privilege_state("kernel", transition, label, pc)
+
+
+def _delete_rel4_transition_probe_bps():
+    for bp in list(_REL4_TRANSITION_PROBE_BPS):
+        try:
+            bp.delete()
+        except Exception:
+            pass
+        try:
+            _CREATED_BPS.remove(bp)
+        except ValueError:
+            pass
+        try:
+            _RUN_SCOPED_BPS.remove(bp)
+        except ValueError:
+            pass
+    _REL4_TRANSITION_PROBE_BPS.clear()
 
 
 def _child_hit_key(tid, parent_cid, parent_sym: str, child_sym: str, child_addr: str):
@@ -1889,6 +2137,49 @@ class PrivilegeGroupBP(gdb.Breakpoint):
         _record_privilege_hit(self.group, self.label)
         return False
 
+
+class Rel4TransitionProbeBP(gdb.Breakpoint):
+    def __init__(self, spec: dict):
+        self.spec = dict(spec)
+        location = self.spec.get("location") or ""
+        super().__init__(location, type=gdb.BP_BREAKPOINT, internal=True)
+        self.silent = True
+        self.location_text = location
+        _REL4_TRANSITION_PROBE_BPS.append(self)
+        _CREATED_BPS.append(self)
+        _RUN_SCOPED_BPS.append(self)
+
+    def stop(self) -> bool:
+        spec = self.spec
+        try:
+            event = (spec.get("event") or "").strip()
+            if event:
+                event_node = _record_transition_event(event)
+                gdb.write(
+                    f"[ARD][rel4-chain] {spec.get('event_message') or '[TRANSITION]'} "
+                    f"transition_event={event_node.get('event', event)}\n"
+                )
+
+            _rel4_set_privilege_for_spec(spec)
+            node = _record_transition_node(
+                spec.get("node_type", "sync"),
+                spec.get("privilege", "unknown"),
+                spec.get("label", ""),
+                func=spec.get("func", ""),
+                file=spec.get("file", ""),
+                fullname=spec.get("fullname", ""),
+                line=spec.get("line", 0),
+                pc=None,
+            )
+            gdb.write(f"[ARD][rel4-chain] {spec.get('message') or node.get('label')}\n")
+            try:
+                self.enabled = False
+            except Exception:
+                pass
+        except Exception as e:
+            gdb.write(f"[ARD][rel4-chain] warning: probe hit failed: {_short_error(e)}\n")
+        return False
+
 # -------------------------
 # Commands
 # -------------------------
@@ -1990,6 +2281,7 @@ class ARDPrivResetCommand(gdb.Command):
         _PRIVILEGE_BPS["kernel"].clear()
         _PRIVILEGE_ACTIVE_GROUP = "user"
         _set_privilege_state("unknown", "none")
+        _reset_transition_path()
         gdb.write("[ARD][priv] reset done.\n")
 
 
@@ -2010,6 +2302,195 @@ class ARDPrivStatusCommand(gdb.Command):
             f"user_bps={len(_PRIVILEGE_BPS.get('user', []))} "
             f"kernel_bps={len(_PRIVILEGE_BPS.get('kernel', []))}\n"
         )
+
+
+class ARDTransitionResetCommand(gdb.Command):
+    """
+    Reset the structured cross-privilege transition path.
+    Usage: ardb-transition-reset
+    """
+    def __init__(self):
+        super().__init__("ardb-transition-reset", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        _reset_transition_path()
+        gdb.write("[ARD][transition] reset done.\n")
+
+
+class ARDTransitionAddCommand(gdb.Command):
+    """
+    Add one node to the structured transition path.
+    Usage:
+      ardb-transition-add type|privilege|label|func|file|fullname|line|pc
+    Only the first three fields are required. Use pipe separators so labels
+    and symbols may contain spaces.
+    """
+    def __init__(self):
+        super().__init__("ardb-transition-add", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        raw = (arg or "").strip()
+        if not raw:
+            gdb.write("Usage: ardb-transition-add type|privilege|label|func|file|fullname|line|pc\n")
+            return
+
+        parts = [p.strip() for p in raw.split("|")]
+        if len(parts) < 3:
+            gdb.write("[ARD][transition] need at least type|privilege|label\n")
+            return
+
+        while len(parts) < 8:
+            parts.append("")
+
+        node_type, privilege, label, func, file, fullname, line, pc = parts[:8]
+        node = _record_transition_node(
+            node_type,
+            privilege,
+            label,
+            func=func,
+            file=file,
+            fullname=fullname,
+            line=line,
+            pc=pc or None,
+        )
+        gdb.write(
+            f"[ARD][transition] added seq={node.get('seq')} "
+            f"{node.get('privilege')} {node.get('type')} {node.get('label')}\n"
+        )
+
+
+class ARDTransitionEventCommand(gdb.Command):
+    """
+    Add a transition event node.
+    Usage: ardb-transition-event user_to_kernel
+    """
+    def __init__(self):
+        super().__init__("ardb-transition-event", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        event = (arg or "").strip() or "unknown"
+        node = _record_transition_event(event)
+        gdb.write(f"[ARD][transition] event seq={node.get('seq')} {event}\n")
+
+
+class ARDTransitionStatusCommand(gdb.Command):
+    """
+    Print the current transition path JSON.
+    Usage: ardb-transition-status
+    """
+    def __init__(self):
+        super().__init__("ardb-transition-status", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        gdb.write(json.dumps({"transition_path": _get_transition_path_snapshot()}) + "\n")
+
+
+class ARDRel4EnableTransitionProbeCommand(gdb.Command):
+    """
+    Install rel4-async boundary breakpoints that populate transition_path.
+    Usage: ardb-rel4-enable-transition-probe
+    """
+    def __init__(self):
+        super().__init__("ardb-rel4-enable-transition-probe", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        _delete_rel4_transition_probe_bps()
+        _reset_transition_path()
+
+        try:
+            gdb.execute("set breakpoint pending on", to_string=True)
+        except Exception:
+            pass
+
+        specs = _rel4_transition_probe_specs()
+        for path in {spec.get("fullname", "") for spec in specs}:
+            _rel4_warn_missing_path(path)
+
+        installed = 0
+        failed = 0
+        for spec in specs:
+            location = spec.get("location") or ""
+            if not location:
+                failed += 1
+                gdb.write(f"[ARD][rel4-chain] warning: empty location for {spec.get('label', '')}\n")
+                continue
+            try:
+                bp = Rel4TransitionProbeBP(spec)
+                installed += 1
+                gdb.write(
+                    f"[ARD][rel4-chain] installed #{bp.number} {location} "
+                    f"{spec.get('label', '')}\n"
+                )
+            except Exception as e:
+                failed += 1
+                gdb.write(
+                    f"[ARD][rel4-chain] warning: failed to install {location} "
+                    f"{spec.get('label', '')}: {_short_error(e)}\n"
+                )
+
+        gdb.write(f"[ARD][rel4-chain] probe enabled: {installed} breakpoints")
+        if failed:
+            gdb.write(f" ({failed} failed)")
+        gdb.write("\n")
+
+
+class ARDRel4DisableTransitionProbeCommand(gdb.Command):
+    """
+    Delete rel4-async transition-path probe breakpoints and reset path state.
+    Usage: ardb-rel4-disable-transition-probe
+    """
+    def __init__(self):
+        super().__init__("ardb-rel4-disable-transition-probe", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        count = len(_REL4_TRANSITION_PROBE_BPS)
+        _delete_rel4_transition_probe_bps()
+        _reset_transition_path()
+        gdb.write(f"[ARD][rel4-chain] probe disabled: deleted {count} breakpoints\n")
+
+
+class ARDRel4TransitionProbeStatusCommand(gdb.Command):
+    """
+    Print rel4-async transition probe status.
+    Usage: ardb-rel4-transition-probe-status
+    """
+    def __init__(self):
+        super().__init__("ardb-rel4-transition-probe-status", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        valid = 0
+        enabled = 0
+        entries = []
+        for bp in list(_REL4_TRANSITION_PROBE_BPS):
+            try:
+                is_valid = bp.is_valid()
+            except Exception:
+                is_valid = False
+            if is_valid:
+                valid += 1
+                try:
+                    if bp.enabled:
+                        enabled += 1
+                except Exception:
+                    pass
+            spec = getattr(bp, "spec", {}) or {}
+            entries.append({
+                "number": getattr(bp, "number", None),
+                "valid": is_valid,
+                "enabled": bool(getattr(bp, "enabled", False)) if is_valid else False,
+                "location": spec.get("location", ""),
+                "label": spec.get("label", ""),
+                "privilege": spec.get("privilege", ""),
+            })
+        gdb.write(json.dumps({
+            "rel4_transition_probe": {
+                "total": len(_REL4_TRANSITION_PROBE_BPS),
+                "valid": valid,
+                "enabled": enabled,
+                "breakpoints": entries,
+            },
+            "transition_path": _get_transition_path_snapshot(),
+        }) + "\n")
 
 
 class ARDResetCommand(gdb.Command):
@@ -2042,9 +2523,11 @@ class ARDResetCommand(gdb.Command):
         _clear_privilege_bps()
         _PRIVILEGE_BPS["user"].clear()
         _PRIVILEGE_BPS["kernel"].clear()
+        _REL4_TRANSITION_PROBE_BPS.clear()
         global _PRIVILEGE_ACTIVE_GROUP
         _PRIVILEGE_ACTIVE_GROUP = "user"
         _set_privilege_state("unknown", "none")
+        _reset_transition_path()
         global _CO_NEXT_ID
         _CO_NEXT_ID = 1
 
@@ -2132,6 +2615,7 @@ class ARDGetSnapshotCommand(gdb.Command):
             "transition_event": _PRIVILEGE_TRANSITION_EVENT,
             "transition_symbol": _PRIVILEGE_LAST_SYMBOL,
             "transition_pc": _PRIVILEGE_LAST_PC,
+            "transition_path": _get_transition_path_snapshot(),
             "path": []
         }
         
@@ -2652,6 +3136,13 @@ def install():
     ARDPrivEnableCommand()
     ARDPrivResetCommand()
     ARDPrivStatusCommand()
+    ARDTransitionResetCommand()
+    ARDTransitionAddCommand()
+    ARDTransitionEventCommand()
+    ARDTransitionStatusCommand()
+    ARDRel4EnableTransitionProbeCommand()
+    ARDRel4DisableTransitionProbeCommand()
+    ARDRel4TransitionProbeStatusCommand()
     ARDResetCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
@@ -2671,4 +3162,4 @@ def install():
             pass
         _EVENTS_INSTALLED = True
 
-    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status\n")
+    gdb.write("[ARD] installed. Commands: ardb-gen-whitelist, ardb-load-whitelist, ardb-trace, ardb-get-snapshot, ardb-reset, ardb-get-whitelist-grouped, ardb-update-whitelist, ardb-infer-trace-root, ardb-priv-add, ardb-priv-enable, ardb-priv-reset, ardb-priv-status, ardb-transition-reset, ardb-transition-add, ardb-transition-event, ardb-transition-status, ardb-rel4-enable-transition-probe, ardb-rel4-disable-transition-probe, ardb-rel4-transition-probe-status\n")

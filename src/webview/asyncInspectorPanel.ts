@@ -1,8 +1,34 @@
 import * as vscode from 'vscode';
 import { ARDDebugAdapterFactory } from '../debugAdapter';
-import { SnapshotData } from '../gdbDebugSession';
+import { SnapshotData, TransitionPathNode } from '../gdbDebugSession';
 import * as path from 'path';
 import * as fs from 'fs';
+
+type SnapshotNode = SnapshotData['path'][0];
+
+interface NodeRef {
+    cid: number | null;
+    func?: string;
+    addr?: string;
+    file?: string;
+    fullname?: string;
+    line?: number;
+}
+
+interface SourceResolution {
+    uri: vscode.Uri;
+    line: number;
+    reason: string;
+    matches?: string[];
+}
+
+interface SourceMapConfig {
+    sourceRoots?: unknown;
+    sourceWorkspace?: unknown;
+    rel4Kernel?: unknown;
+    rootTaskDemo?: unknown;
+    [key: string]: unknown;
+}
 
 /**
  * Async Inspector Panel - Webview for displaying async execution trees
@@ -17,6 +43,8 @@ export class AsyncInspectorPanel {
     private _treeRoots: Map<number, TreeNode> = new Map(); // root CID -> tree node
     /** Cache of the last snapshot, used by selectNode to find frame indices. */
     private _lastSnapshot: SnapshotData | undefined;
+    private _lastTransitionPath: TransitionPathNode[] = [];
+    private readonly _outputChannel = vscode.window.createOutputChannel('ARD Inspector');
 
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri, debugAdapterFactory: ARDDebugAdapterFactory) {
         this._panel = panel;
@@ -44,6 +72,9 @@ export class AsyncInspectorPanel {
                         break;
                     case 'snapshot':
                         await this.handleSnapshot();
+                        break;
+                    case 'connectRemote':
+                        await this.handleConnectRemote();
                         break;
                     case 'selectNode':
                         await this.handleSelectNode(message);
@@ -111,7 +142,7 @@ export class AsyncInspectorPanel {
             // No delay needed — the FIFO command queue in gdbAdapter
             // correctly routes console output even when MI commands
             // are in flight concurrently.
-            this.handleSnapshot().catch((e) => {
+            this.handleSnapshot(true).catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
         }
@@ -122,9 +153,39 @@ export class AsyncInspectorPanel {
         if (session) {
             await session.reset();
             this._treeRoots.clear();
+            this._lastTransitionPath = [];
             this._update();
             vscode.window.showInformationMessage('ARD reset completed');
         }
+    }
+
+    private async handleConnectRemote(): Promise<void> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            const message = '[ARD] failed to connect remote target :1234: no active debug session';
+            this.inspectorLog('error', message);
+            vscode.window.showErrorMessage(message);
+            this._panel.webview.postMessage({
+                command: 'connectRemoteResult',
+                status: 'failed',
+                message,
+            });
+            return;
+        }
+
+        const result = await session.connectRemote(':1234');
+        const level = result.status === 'failed' ? 'error' : 'info';
+        this.inspectorLog(level, result.message);
+        if (result.status === 'failed') {
+            vscode.window.showErrorMessage(result.message);
+        } else {
+            vscode.window.showInformationMessage(result.message);
+        }
+        this._panel.webview.postMessage({
+            command: 'connectRemoteResult',
+            status: result.status,
+            message: result.message,
+        });
     }
 
     private async handleGenWhitelist(): Promise<void> {
@@ -144,134 +205,56 @@ export class AsyncInspectorPanel {
         }
     }
 
-    private async handleSnapshot(): Promise<void> {
+    private async handleSnapshot(suppressOutput: boolean = false): Promise<void> {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (!session) {
             console.warn('[AsyncInspector] handleSnapshot: no GDB session from factory');
             return;
         }
 
-        const snapshot = await session.getSnapshot();
+        const snapshot = await session.getSnapshot(suppressOutput);
         console.log('[AsyncInspector] handleSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
         if (snapshot) {
             this._lastSnapshot = snapshot;
+            this._lastTransitionPath = Array.isArray(snapshot.transition_path)
+                ? snapshot.transition_path
+                : [];
             this.updateTreeFromSnapshot(snapshot);
 
             this._panel.webview.postMessage({
                 command: 'updateTree',
                 treeData: Array.from(this._treeRoots.values()),
+                transitionPath: this._lastTransitionPath,
             });
         }
     }
 
-    private async handleSelectNode(nodeRef: {
-        cid: number | null;
-        func?: string;
-        addr?: string;
-        file?: string;
-        fullname?: string;
-        line?: number;
-    }): Promise<void> {
-        if (!this._debugSession) {
-            return;
-        }
+    private async handleSelectNode(nodeRef: NodeRef): Promise<void> {
         console.log('[AsyncInspector] selectNode cid=', nodeRef.cid, 'typeof=', typeof nodeRef.cid);
         const snapshot = this._lastSnapshot;
-        if (!snapshot) {
-            return;
+        const target = snapshot ? this.findSnapshotNode(snapshot, nodeRef) : undefined;
+        const symbol = target?.func || nodeRef.func || '<unknown>';
+
+        const resolution = await this.resolveNodeSourceLocation(target, nodeRef);
+        if (resolution) {
+            this.inspectorLog(
+                'info',
+                `[Inspector] Node click: ${symbol} -> ${resolution.uri.fsPath}:${resolution.line}`
+            );
+            if (resolution.matches && resolution.matches.length > 1) {
+                this.inspectorLog(
+                    'warn',
+                    `[Inspector] Warning: multiple matches for ${symbol}, selected ${resolution.uri.fsPath}:${resolution.line}`
+                );
+            }
+            await this.openSourceAt(resolution.uri, resolution.line);
+        } else {
+            this.inspectorLog('error', `[Inspector] Error: ${symbol} file not found`);
+            vscode.window.showWarningMessage(`Cannot locate source for: ${symbol}`);
         }
 
-        // Case 1: normal CID-backed async node
-        if (nodeRef.cid !== null) {
-            const targetCid = Number(nodeRef.cid);
-            let targetFrameIndex = -1;
-            for (let i = 0; i < snapshot.path.length; i++) {
-                const node = snapshot.path[i];
-                if (node.type === 'async' && Number(node.cid) === targetCid) {
-                    targetFrameIndex = snapshot.path.length - 1 - i;
-                    break;
-                }
-            }
-
-            if (targetFrameIndex >= 0) {
-                try {
-                    const stackTrace = await this._debugSession.customRequest('stackTrace', {
-                        threadId: snapshot.thread_id,
-                        startFrame: 0,
-                        levels: 200,
-                    });
-
-                    const frames = stackTrace?.stackFrames || [];
-                    if (frames.length > targetFrameIndex) {
-                        const frame = frames[targetFrameIndex];
-
-                        await this._debugSession.customRequest('evaluate', {
-                            expression: `frame ${targetFrameIndex}`,
-                            context: 'repl',
-                        });
-
-                        const snapNode = snapshot.path.find(
-                            n => n.type === 'async' && Number(n.cid) === targetCid
-                        );
-
-                        const sourcePath =
-                            snapNode?.file ||
-                            snapNode?.fullname ||
-                            frame.source?.path ||
-                            '';
-
-                        const sourceLine =
-                            snapNode?.line ||
-                            frame.line ||
-                            0;
-                        console.log('[AsyncInspector] root-select', {
-                            nodeRef,
-                            targetCid,
-                            snapNode,
-                            sourcePath,
-                            sourceLine,
-                        });
-                        if (sourcePath) {
-                            await this.handleSelectFrame(sourcePath, sourceLine);
-                        }
-                    }
-                } catch (error) {
-                    console.error('Failed to switch frame:', error);
-                }
-            }
-
-            return;
-        }
-
-        // Case 2: async node without CID — fallback to source jump only
-        const target = snapshot.path.find(
-            n =>
-                n.type === 'async' &&
-                n.cid === null &&
-                n.func === nodeRef.func &&
-                n.addr === nodeRef.addr
-        );
-
-        const filePath =
-            target?.file ||
-            target?.fullname ||
-            nodeRef.file ||
-            nodeRef.fullname ||
-            '';
-
-        const line =
-            target?.line ||
-            nodeRef.line ||
-            0;
-        console.log('[AsyncInspector] child-select', {
-            nodeRef,
-            target,
-            filePath,
-            line,
-        });
-
-        if (filePath) {
-            await this.handleSelectFrame(filePath, line);
+        if (snapshot && nodeRef.cid !== null) {
+            await this.trySelectDebugFrame(snapshot, Number(nodeRef.cid));
         }
     }
 
@@ -313,6 +296,75 @@ export class AsyncInspectorPanel {
             });
         }
     }
+
+    private inspectorLog(level: 'info' | 'warn' | 'error', message: string): void {
+        this._outputChannel.appendLine(message);
+        if (level === 'warn') {
+            console.warn(message);
+        } else if (level === 'error') {
+            console.error(message);
+        } else {
+            console.log(message);
+        }
+    }
+
+    private findSnapshotNode(snapshot: SnapshotData, nodeRef: NodeRef): SnapshotNode | undefined {
+        if (nodeRef.cid !== null && nodeRef.cid !== undefined) {
+            const targetCid = Number(nodeRef.cid);
+            const cidMatches = snapshot.path.filter(
+                n => n.type === 'async' && Number(n.cid) === targetCid
+            );
+            if (cidMatches.length > 0) {
+                return cidMatches[cidMatches.length - 1];
+            }
+        }
+
+        const exactMatches = snapshot.path.filter(
+            n =>
+                n.func === nodeRef.func &&
+                (!nodeRef.addr || n.addr === nodeRef.addr)
+        );
+        if (exactMatches.length > 0) {
+            return exactMatches[exactMatches.length - 1];
+        }
+
+        return undefined;
+    }
+
+    private async trySelectDebugFrame(snapshot: SnapshotData, targetCid: number): Promise<void> {
+        if (!this._debugSession) {
+            return;
+        }
+
+        let targetFrameIndex = -1;
+        for (let i = 0; i < snapshot.path.length; i++) {
+            const node = snapshot.path[i];
+            if (node.type === 'async' && Number(node.cid) === targetCid) {
+                targetFrameIndex = snapshot.path.length - 1 - i;
+                break;
+            }
+        }
+
+        if (targetFrameIndex < 0) {
+            return;
+        }
+
+        try {
+            await this._debugSession.customRequest('stackTrace', {
+                threadId: snapshot.thread_id,
+                startFrame: 0,
+                levels: 200,
+            });
+
+            await this._debugSession.customRequest('evaluate', {
+                expression: `frame ${targetFrameIndex}`,
+                context: 'repl',
+            });
+        } catch (error) {
+            console.error('Failed to switch frame:', error);
+        }
+    }
+
     private buildSearchRoots(initialRoots: string[]): string[] {
         const roots: string[] = [];
         const seen = new Set<string>();
@@ -337,21 +389,206 @@ export class AsyncInspectorPanel {
 
         return roots;
     }
-    private async findFileBySuffix(
+
+    private addPathRoot(roots: string[], seen: Set<string>, candidate: unknown): void {
+        if (typeof candidate !== 'string' || !candidate.trim()) {
+            return;
+        }
+
+        const expanded = this.expandPathVariables(candidate.trim());
+        const resolved = path.isAbsolute(expanded)
+            ? path.resolve(expanded)
+            : path.resolve(this.getPrimaryWorkspaceRoot() || process.cwd(), expanded);
+
+        if (!seen.has(resolved) && fs.existsSync(resolved)) {
+            seen.add(resolved);
+            roots.push(resolved);
+        }
+    }
+
+    private expandPathVariables(value: string): string {
+        const workspaceRoot = this.getPrimaryWorkspaceRoot() || '';
+        const sessionCwd = this.getSessionCwd() || workspaceRoot;
+        return value
+            .replace(/\$\{workspaceFolder\}/g, workspaceRoot)
+            .replace(/\$\{cwd\}/g, sessionCwd);
+    }
+
+    private getPrimaryWorkspaceRoot(): string | undefined {
+        return (
+            this._debugSession?.workspaceFolder?.uri.fsPath ||
+            vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+        );
+    }
+
+    private getSessionCwd(): string | undefined {
+        const config = this._debugSession?.configuration;
+        const workspaceRoot = this.getPrimaryWorkspaceRoot();
+        if (typeof config?.cwd === 'string' && config.cwd.trim()) {
+            const expanded = this.expandPathVariablesWithoutCwd(config.cwd, workspaceRoot);
+            return path.isAbsolute(expanded)
+                ? path.resolve(expanded)
+                : path.resolve(workspaceRoot || process.cwd(), expanded);
+        }
+        return workspaceRoot;
+    }
+
+    private expandPathVariablesWithoutCwd(value: string, workspaceRoot?: string): string {
+        return workspaceRoot
+            ? value.replace(/\$\{workspaceFolder\}/g, workspaceRoot)
+            : value;
+    }
+
+    private sourceMapCandidates(): string[] {
+        const candidates: string[] = [];
+        const seen = new Set<string>();
+
+        const add = (candidate: string | undefined) => {
+            if (!candidate) {
+                return;
+            }
+            const resolved = path.resolve(candidate);
+            if (!seen.has(resolved) && fs.existsSync(resolved)) {
+                seen.add(resolved);
+                candidates.push(resolved);
+            }
+        };
+
+        const workspaceRoots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) || [];
+        for (const root of workspaceRoots) {
+            add(path.join(root, 'source-map.json'));
+            const testcaseRoot = path.join(root, 'testcases');
+            try {
+                const entries = fs.readdirSync(testcaseRoot, { withFileTypes: true });
+                for (const entry of entries) {
+                    if (entry.isDirectory()) {
+                        add(path.join(testcaseRoot, entry.name, 'source-map.json'));
+                    }
+                }
+            } catch {
+                // No testcase source maps in this workspace.
+            }
+        }
+
+        const config = this._debugSession?.configuration;
+        if (typeof config?.sourceMap === 'string') {
+            add(this.expandPathVariables(config.sourceMap));
+        }
+
+        return candidates;
+    }
+
+    private sourceRootsFromSourceMaps(): string[] {
+        const roots: string[] = [];
+        const seen = new Set<string>();
+
+        for (const mapPath of this.sourceMapCandidates()) {
+            try {
+                const parsed = JSON.parse(fs.readFileSync(mapPath, 'utf8')) as SourceMapConfig;
+                this.addSourceMapRootFields(roots, seen, parsed);
+            } catch (error) {
+                this.inspectorLog('warn', `[Inspector] Warning: cannot read source map ${mapPath}: ${error}`);
+            }
+        }
+
+        return roots;
+    }
+
+    private addSourceMapRootFields(roots: string[], seen: Set<string>, parsed: SourceMapConfig): void {
+        if (Array.isArray(parsed.sourceRoots)) {
+            for (const root of parsed.sourceRoots) {
+                this.addPathRoot(roots, seen, root);
+            }
+        }
+
+        // Prefer concrete source subtrees before broad workspaces.
+        this.addPathRoot(roots, seen, parsed.rel4Kernel);
+        this.addPathRoot(roots, seen, parsed.rootTaskDemo);
+
+        for (const [key, value] of Object.entries(parsed)) {
+            if (
+                key === 'sourceRoots' ||
+                key === 'sourceWorkspace' ||
+                key === 'rel4Kernel' ||
+                key === 'rootTaskDemo'
+            ) {
+                continue;
+            }
+            if (/(source|root|project|kernel|demo)/i.test(key)) {
+                this.addPathRoot(roots, seen, value);
+            }
+        }
+
+        this.addPathRoot(roots, seen, parsed.sourceWorkspace);
+    }
+
+    private configuredSourceRoots(): string[] {
+        const roots: string[] = [];
+        const seen = new Set<string>();
+        const config = this._debugSession?.configuration;
+
+        if (Array.isArray(config?.sourceRoots)) {
+            for (const root of config.sourceRoots) {
+                this.addPathRoot(roots, seen, root);
+            }
+        }
+
+        if (typeof config?.cwd === 'string') {
+            this.addPathRoot(roots, seen, config.cwd);
+        }
+
+        if (typeof config?.program === 'string') {
+            const expanded = this.expandPathVariables(config.program);
+            this.addPathRoot(roots, seen, path.dirname(expanded));
+        }
+
+        return roots;
+    }
+
+    private sourceSearchRoots(): string[] {
+        const roots: string[] = [];
+        const seen = new Set<string>();
+
+        const addExisting = (candidate: string) => this.addPathRoot(roots, seen, candidate);
+
+        for (const root of this.configuredSourceRoots()) {
+            addExisting(root);
+        }
+
+        for (const root of this.sourceRootsFromSourceMaps()) {
+            addExisting(root);
+        }
+
+        const workspaceRoots = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) || [];
+        for (const root of this.buildSearchRoots(workspaceRoots)) {
+            addExisting(root);
+        }
+
+        return roots;
+    }
+
+    private async findFilesBySuffix(
         roots: string[],
         suffix: string,
-    ): Promise<string | undefined> {
+        limit = 8,
+    ): Promise<string[]> {
         const normalizedSuffix = suffix.replace(/\\/g, '/').toLowerCase();
+        const matches: string[] = [];
+        const seen = new Set<string>();
 
-        const walk = async (dir: string): Promise<string | undefined> => {
+        const walk = async (dir: string): Promise<void> => {
             let entries: fs.Dirent[];
             try {
                 entries = await fs.promises.readdir(dir, { withFileTypes: true });
             } catch {
-                return undefined;
+                return;
             }
 
             for (const entry of entries) {
+                if (matches.length >= limit) {
+                    return;
+                }
+
                 // 跳过常见无关目录，避免搜索太慢
                 if (entry.isDirectory()) {
                     if (
@@ -359,6 +596,8 @@ export class AsyncInspectorPanel {
                         entry.name === 'node_modules' ||
                         entry.name === 'target' ||
                         entry.name === 'out' ||
+                        entry.name === 'build' ||
+                        entry.name.startsWith('build-') ||
                         entry.name === '.vscode'
                     ) {
                         continue;
@@ -368,101 +607,260 @@ export class AsyncInspectorPanel {
                 const fullPath = path.join(dir, entry.name);
 
                 if (entry.isDirectory()) {
-                    const found = await walk(fullPath);
-                    if (found) {
-                        return found;
-                    }
+                    await walk(fullPath);
                 } else if (entry.isFile()) {
                     const normalizedFull = fullPath.replace(/\\/g, '/').toLowerCase();
                     if (normalizedFull.endsWith(normalizedSuffix)) {
                         console.log('[AsyncInspector] findFileBySuffix hit=' + fullPath);
-                        return fullPath;
+                        const resolved = path.resolve(fullPath);
+                        if (!seen.has(resolved)) {
+                            seen.add(resolved);
+                            matches.push(resolved);
+                        }
                     }
                 }
             }
-
-            return undefined;
         };
 
         for (const root of roots) {
-            const found = await walk(root);
-            if (found) {
-                return found;
+            if (matches.length >= limit) {
+                break;
+            }
+            if (this.isBroadRecursiveSearchRoot(root)) {
+                continue;
+            }
+            await walk(root);
+        }
+
+        return matches;
+    }
+
+    private isBroadRecursiveSearchRoot(root: string): boolean {
+        const resolved = path.resolve(root);
+        const parsed = path.parse(resolved);
+        const home = process.env.HOME ? path.resolve(process.env.HOME) : '';
+        return resolved === parsed.root || resolved === home || resolved === path.dirname(home);
+    }
+
+    private sourceTailsFromFile(file: string): string[] {
+        const normalizedInput = file.replace(/\\/g, '/');
+        const tails: string[] = [];
+        const seen = new Set<string>();
+        const add = (tail: string) => {
+            const normalized = tail.replace(/\\/g, '/').replace(/^\/+/, '');
+            if (normalized && !seen.has(normalized)) {
+                seen.add(normalized);
+                tails.push(normalized);
+            }
+        };
+
+        if (!path.isAbsolute(file)) {
+            add(normalizedInput);
+        }
+
+        const parts = normalizedInput.split('/').filter(Boolean);
+        const markers = ['projects', 'rel4_kernel', 'kernel', 'crates', 'src', 'testsuite', 'tests', 'test', 'examples', 'os'];
+        for (let i = 0; i < parts.length; i++) {
+            if (markers.includes(parts[i])) {
+                add(parts.slice(i).join('/'));
             }
         }
 
-        return undefined;
+        add(parts.slice(-4).join('/'));
+        add(parts.slice(-3).join('/'));
+        add(parts.slice(-2).join('/'));
+        add(parts.slice(-1).join('/'));
+
+        return tails;
     }
 
-    private async resolveSourceUri(file: string): Promise<vscode.Uri | undefined> {
-        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-        const workspaceRoots = workspaceFolders.map(f => f.uri.fsPath);
-        const searchRoots = this.buildSearchRoots(workspaceRoots);
-        const normalizedInput = file.replace(/\\/g, '/');
+    private sourceTailsFromSymbol(symbol: string): string[] {
+        const stripped = symbol
+            .replace(/\{async_fn#[^}]+}/g, '')
+            .replace(/<[^>]*>/g, '')
+            .replace(/::h[0-9a-fA-F]+$/g, '');
+        const parts = stripped
+            .split('::')
+            .map(p => p.trim())
+            .filter(p => p && !p.startsWith('{') && !p.includes('$'));
+
+        const tails: string[] = [];
+        const seen = new Set<string>();
+        const add = (tail: string) => {
+            const normalized = tail.replace(/\\/g, '/').replace(/^\/+/, '');
+            if (normalized && !seen.has(normalized)) {
+                seen.add(normalized);
+                tails.push(normalized);
+            }
+        };
+
+        for (let i = parts.length - 1; i >= 0; i--) {
+            const part = parts[i];
+            if (/^[A-Z]/.test(part) || part === 'execute' || part === 'poll') {
+                continue;
+            }
+
+            add(`${part}.rs`);
+            if (i > 0) {
+                add(`${parts[i - 1]}/${part}.rs`);
+            }
+            if (i > 1) {
+                add(`${parts[i - 2]}/${parts[i - 1]}/${part}.rs`);
+            }
+        }
+
+        return tails;
+    }
+
+    private async resolveSourceFile(file: string, symbol?: string): Promise<{ uri: vscode.Uri; matches?: string[] } | undefined> {
+        const searchRoots = this.sourceSearchRoots();
 
         console.log(
             '[AsyncInspector] resolveSourceUri input file=' + file +
             ' isAbsolute=' + String(path.isAbsolute(file)) +
-            ' workspaceRoots=' + JSON.stringify(workspaceRoots) +
             ' searchRoots=' + JSON.stringify(searchRoots)
         );
 
         // 1) 绝对路径且真实存在
         if (path.isAbsolute(file) && fs.existsSync(file)) {
             console.log('[AsyncInspector] resolveSourceUri absolute-hit=' + file);
-            return vscode.Uri.file(file);
+            this.inspectorLog('info', '[Inspector] Selected file found in workspace');
+            return { uri: vscode.Uri.file(file) };
         }
 
-        // 2) 坏掉的绝对路径 -> 降级成相对后缀
-        let searchTail = normalizedInput;
-        if (path.isAbsolute(file)) {
-            const parts = normalizedInput.split('/').filter(Boolean);
-            const markers = ['testsuite', 'src', 'tests', 'test', 'examples', 'os'];
-            let markerIndex = -1;
+        const tails = [
+            ...this.sourceTailsFromFile(file),
+            ...(symbol ? this.sourceTailsFromSymbol(symbol) : []),
+        ];
+        const seenTails = new Set<string>();
 
-            for (let i = 0; i < parts.length; i++) {
-                if (markers.includes(parts[i])) {
-                    markerIndex = i;
-                    break;
+        for (const searchTail of tails) {
+            if (!searchTail || seenTails.has(searchTail)) {
+                continue;
+            }
+            seenTails.add(searchTail);
+
+            // 2) 用所有 searchRoots 直接拼接尝试
+            for (const root of searchRoots) {
+                const candidate = path.join(root, searchTail);
+                console.log('[AsyncInspector] resolveSourceUri candidate=' + candidate);
+                if (fs.existsSync(candidate)) {
+                    console.log('[AsyncInspector] resolveSourceUri candidate-hit=' + candidate);
+                    this.inspectorLog('info', '[Inspector] Selected file found in workspace');
+                    return { uri: vscode.Uri.file(candidate) };
                 }
             }
 
-            if (markerIndex >= 0) {
-                searchTail = parts.slice(markerIndex).join('/');
-            } else {
-                searchTail = parts.slice(-3).join('/');
+            // 3) 递归后缀搜索
+            const matches = await this.findFilesBySuffix(searchRoots, searchTail);
+            console.log('[AsyncInspector] resolveSourceUri recursive-found=' + JSON.stringify(matches));
+            if (matches.length > 0) {
+                this.inspectorLog('info', '[Inspector] Selected file found in workspace');
+                return { uri: vscode.Uri.file(matches[0]), matches };
             }
-        }
-
-        // 3) 用所有 searchRoots 直接拼接尝试
-        for (const root of searchRoots) {
-            const candidate = path.join(root, searchTail);
-            console.log('[AsyncInspector] resolveSourceUri candidate=' + candidate);
-            if (fs.existsSync(candidate)) {
-                console.log('[AsyncInspector] resolveSourceUri candidate-hit=' + candidate);
-                return vscode.Uri.file(candidate);
-            }
-        }
-
-        // 4) 递归后缀搜索
-        const found = await this.findFileBySuffix(searchRoots, searchTail);
-        console.log('[AsyncInspector] resolveSourceUri recursive-found=' + String(found));
-        if (found) {
-            return vscode.Uri.file(found);
         }
 
         console.log('[AsyncInspector] resolveSourceUri failed', {
             file,
-            searchTail,
+            tails,
             searchRoots,
         });
 
         return undefined;
     }
 
+    private parseInfoLine(output: string): { file: string; line: number } | undefined {
+        const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
+        if (!match) {
+            return undefined;
+        }
+        return {
+            line: parseInt(match[1], 10),
+            file: match[2],
+        };
+    }
+
+    private async querySymbolSourceLocation(symbol: string): Promise<{ file: string; line: number } | undefined> {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session || !symbol || symbol === '<unknown>') {
+            return undefined;
+        }
+
+        try {
+            const escaped = symbol.replace(/'/g, "\\'");
+            const output = await session.executeGDBCommand(`info line '${escaped}'`);
+            return this.parseInfoLine(output);
+        } catch (error) {
+            console.error('Failed to locate symbol:', error);
+            return undefined;
+        }
+    }
+
+    private validLine(line: unknown): number | undefined {
+        if (typeof line !== 'number' || !Number.isFinite(line) || line <= 0) {
+            return undefined;
+        }
+        return Math.floor(line);
+    }
+
+    private async resolveNodeSourceLocation(
+        node: SnapshotNode | undefined,
+        nodeRef: NodeRef,
+    ): Promise<SourceResolution | undefined> {
+        const symbol = node?.func || nodeRef.func || '';
+        const snapshotFile = node?.file || node?.fullname || nodeRef.file || nodeRef.fullname || '';
+        const snapshotLine = this.validLine(node?.line) || this.validLine(nodeRef.line);
+
+        if (snapshotFile) {
+            const resolved = await this.resolveSourceFile(snapshotFile, symbol);
+            if (resolved) {
+                return {
+                    uri: resolved.uri,
+                    line: snapshotLine || 1,
+                    reason: 'snapshot',
+                    matches: resolved.matches,
+                };
+            }
+        }
+
+        const gdbLocation = await this.querySymbolSourceLocation(symbol);
+        if (gdbLocation) {
+            const resolved = await this.resolveSourceFile(gdbLocation.file, symbol);
+            if (resolved) {
+                return {
+                    uri: resolved.uri,
+                    line: gdbLocation.line,
+                    reason: 'gdb-info-line',
+                    matches: resolved.matches,
+                };
+            }
+        }
+
+        for (const tail of this.sourceTailsFromSymbol(symbol)) {
+            const matches = await this.findFilesBySuffix(this.sourceSearchRoots(), tail);
+            if (matches.length > 0) {
+                return {
+                    uri: vscode.Uri.file(matches[0]),
+                    line: snapshotLine || 1,
+                    reason: 'symbol-source-roots',
+                    matches,
+                };
+            }
+        }
+
+        return undefined;
+    }
+
     private async openSourceAt(uri: vscode.Uri, line: number): Promise<void> {
         const doc = await vscode.workspace.openTextDocument(uri);
-        const targetLine = Math.max(0, line - 1);
+        let targetLine = Math.max(0, line - 1);
+        if (targetLine >= doc.lineCount) {
+            this.inspectorLog(
+                'warn',
+                `[Inspector] Warning: line ${line} is outside ${uri.fsPath} (${doc.lineCount} lines), opening last line`
+            );
+            targetLine = Math.max(0, doc.lineCount - 1);
+        }
         await vscode.window.showTextDocument(doc, {
             selection: new vscode.Range(targetLine, 0, targetLine, 0),
             preserveFocus: false,
@@ -479,13 +877,13 @@ export class AsyncInspectorPanel {
         }
 
         try {
-            const uri = await this.resolveSourceUri(file);
-            if (!uri) {
+            const resolved = await this.resolveSourceFile(file);
+            if (!resolved) {
                 vscode.window.showWarningMessage(`Cannot resolve file: ${file}`);
                 return;
             }
 
-            await this.openSourceAt(uri, line);
+            await this.openSourceAt(resolved.uri, line || 1);
         } catch (error) {
             console.error('Failed to open source file:', error);
             vscode.window.showWarningMessage(`Cannot open file: ${file}`);
@@ -511,6 +909,10 @@ export class AsyncInspectorPanel {
     }
 
     private updateTreeFromSnapshot(snapshot: SnapshotData): void {
+        // The Inspector is a view of the current snapshot, not accumulated
+        // trace history. Rebuild so nodes absent from this path disappear.
+        this._treeRoots.clear();
+
         if (snapshot.path.length === 0) {
             return;
         }
@@ -661,46 +1063,38 @@ export class AsyncInspectorPanel {
                 current = nextChild;
             } else if (node.type === 'sync') {
                 // Dedup sync nodes by func + addr
-                const existing = current.children.find(
+                let syncChild = current.children.find(
                     c => c.type === 'sync' && c.func === node.func && c.addr === node.addr
                 );
-                if (!existing) {
-                    const syncChild: TreeNode = {
+                if (!syncChild) {
+                    syncChild = {
                         type: 'sync',
                         cid: null,
                         func: node.func,
                         addr: node.addr,
-                        poll: 0,
-                        state: 'NON-ASYNC',
+                        poll: node.poll ?? 0,
+                        state: node.state ?? 'NON-ASYNC',
                         origin: this.getSnapshotNodeOrigin(node),
+                        file: node.file,
+                        fullname: node.fullname,
+                        line: node.line,
                         children: [],
                     };
                     this.copySnapshotMetadata(syncChild, node);
                     current.children.push(syncChild);
                 } else {
-                    existing.origin = this.getSnapshotNodeOrigin(node);
-                    this.copySnapshotMetadata(existing, node);
-                }
-            } else if (node.type === 'sync') {
-                // Dedup sync nodes by func + addr
-                const existing = current.children.find(
-                    c => c.type === 'sync' && c.func === node.func && c.addr === node.addr
-                );
-                if (!existing) {
-                    const syncChild: TreeNode = {
-                        type: 'sync',
-                        cid: null,
-                        func: node.func,
-                        addr: node.addr,
-                        poll: 0,
-                        state: 'NON-ASYNC',
-                        origin: this.getSnapshotNodeOrigin(node),
-                        children: [],
-                    };
+                    syncChild.poll = node.poll ?? 0;
+                    syncChild.state = node.state ?? 'NON-ASYNC';
+                    syncChild.origin = this.getSnapshotNodeOrigin(node);
+                    syncChild.file = node.file;
+                    syncChild.fullname = node.fullname;
+                    syncChild.line = node.line;
                     this.copySnapshotMetadata(syncChild, node);
-                    current.children.push(syncChild);
-                    // Sync nodes are leaf-like, don't descend into them
                 }
+
+                // snapshot.path is one logical chain, so consecutive physical
+                // frames must be nested rather than flattened as siblings.
+                current = syncChild;
             }
         }
     }
@@ -724,6 +1118,85 @@ export class AsyncInspectorPanel {
                 <meta charset="UTF-8">
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <link href="${styleUri}" rel="stylesheet">
+                <style>
+                    .node-badges {
+                        display: flex;
+                        flex-wrap: wrap;
+                        gap: 4px;
+                        margin-bottom: 2px;
+                    }
+                    .ard-badge {
+                        display: inline-block;
+                        padding: 1px 5px;
+                        border-radius: 3px;
+                        border: 1px solid var(--vscode-panel-border);
+                        font-size: 10px;
+                        font-weight: 600;
+                        line-height: 1.4;
+                        color: var(--vscode-descriptionForeground);
+                    }
+                    .ard-badge.async { color: #ff8a8a; }
+                    .ard-badge.sync { color: #69db7c; }
+                    .ard-badge.kernel { color: #74c0fc; }
+                    .ard-badge.user { color: #ffd43b; }
+                    .ard-badge.trace { color: #b197fc; }
+                    .ard-badge.state-ok { color: #69db7c; }
+                    .ard-badge.state-unsupported { color: #ffa94d; }
+                    .ard-badge.transition { color: #ff8787; }
+                    .node-detail-line {
+                        font-size: 11px;
+                        color: var(--vscode-descriptionForeground);
+                        margin-top: 2px;
+                        overflow-wrap: anywhere;
+                    }
+                    .node-detail-note {
+                        color: var(--vscode-editorWarning-foreground, var(--vscode-descriptionForeground));
+                    }
+                    .transition-chain {
+                        display: block;
+                        flex: 1 1 50%;
+                        min-height: 0;
+                        margin: 0;
+                        padding: 8px;
+                        border: 1px solid var(--vscode-panel-border);
+                        border-radius: 4px;
+                        background: var(--vscode-editorWidget-background);
+                        overflow-y: auto;
+                    }
+                    .transition-chain-title {
+                        font-weight: 600;
+                        font-size: 12px;
+                        margin-bottom: 6px;
+                    }
+                    .transition-chain-node {
+                        cursor: pointer;
+                        padding: 3px 4px;
+                        border-radius: 3px;
+                        font-size: 11px;
+                        overflow-wrap: anywhere;
+                    }
+                    .transition-chain-node:hover {
+                        background-color: var(--vscode-list-hoverBackground);
+                    }
+                    .transition-chain-arrow {
+                        color: var(--vscode-descriptionForeground);
+                        font-size: 11px;
+                        padding-left: 10px;
+                    }
+                    .side-panel {
+                        min-height: 0;
+                        overflow: hidden;
+                        gap: 12px;
+                    }
+                    .candidates-section {
+                        flex: 1 1 50%;
+                        min-height: 0;
+                    }
+                    #candidatesList {
+                        max-height: none;
+                        overflow-y: visible;
+                    }
+                </style>
                 <title>Async Inspector</title>
             </head>
             <body>
@@ -732,6 +1205,7 @@ export class AsyncInspectorPanel {
                         <button id="resetBtn" class="btn">Reset</button>
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
                         <button id="snapshotBtn" class="btn">Snapshot</button>
+                        <button id="connectRemoteBtn" class="btn">Connect :1234</button>
                     </div>
                     <div style="padding: 0 10px 10px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;">
                         Snapshot reflects the current stopped execution context. Trace hits may not appear in the tree unless execution is stopped near the related poll/await site.
@@ -746,15 +1220,22 @@ export class AsyncInspectorPanel {
                                 <h3>Candidates</h3>
                                 <div id="candidatesList"></div>
                             </div>
+                            <div id="transitionChain" class="transition-chain"></div>
                         </div>
                     </div>
                 </div>
                 <script>
+                    window.ardInspectorVscode = window.ardInspectorVscode || acquireVsCodeApi();
+                    window.acquireVsCodeApi = function() { return window.ardInspectorVscode; };
                     window.treeData = ${JSON.stringify(Array.from(this._treeRoots.values()))};
+                    window.transitionPath = ${JSON.stringify(this._lastTransitionPath)};
                 </script>
                 <script src="${scriptUri}"></script>
                 <script>
                     (function() {
+                        var patchScheduled = false;
+                        var isPatching = false;
+
                         function flattenTree(nodes, out) {
                             out = out || [];
                             if (!Array.isArray(nodes)) {
@@ -765,6 +1246,226 @@ export class AsyncInspectorPanel {
                                 flattenTree(node.children, out);
                             });
                             return out;
+                        }
+
+                        function valueOrNA(value) {
+                            return value === undefined || value === null || value === '' ? 'N/A' : String(value);
+                        }
+
+                        function addBadge(container, text, extraClass) {
+                            var badge = document.createElement('span');
+                            badge.className = 'ard-badge ' + (extraClass || '');
+                            badge.textContent = text;
+                            container.appendChild(badge);
+                        }
+
+                        function stateBadge(node) {
+                            var status = node && node.state_read_status;
+                            if (status === 'ok') {
+                                return { text: 'STATE:OK', cls: 'state-ok' };
+                            }
+                            if (status === 'unsupported') {
+                                return { text: 'STATE:UNSUPPORTED', cls: 'state-unsupported' };
+                            }
+                            if (status) {
+                                return { text: 'STATE:' + String(status).toUpperCase(), cls: 'state-unsupported' };
+                            }
+                            return { text: 'STATE:N/A', cls: 'state-unsupported' };
+                        }
+
+                        function originBadge(node) {
+                            var origin = node && node.origin;
+                            switch (origin) {
+                                case 'trace':
+                                    return 'TRACE';
+                                case 'trace-upgraded':
+                                    return 'TRACE-UPGRADED';
+                                case 'inferred':
+                                    return 'INFERRED';
+                                case 'physical':
+                                    return 'PHYSICAL';
+                                default:
+                                    return 'ORIGIN:N/A';
+                            }
+                        }
+
+                        function transitionBadge(node) {
+                            var event = node && node.transition_event;
+                            if (event === 'user_to_kernel') {
+                                return 'USER->KERNEL';
+                            }
+                            if (event === 'kernel_to_user') {
+                                return 'KERNEL->USER';
+                            }
+                            if (event && event !== 'none') {
+                                return String(event).toUpperCase();
+                            }
+                            return '';
+                        }
+
+                        function formatEvidence(node) {
+                            var origin = node && node.origin;
+                            switch (origin) {
+                                case 'trace':
+                                    return 'Evidence: real poll hit';
+                                case 'trace-upgraded':
+                                    return 'Evidence: inferred node upgraded by trace hit';
+                                case 'inferred':
+                                    return 'Evidence: inferred from frame / awaitee';
+                                case 'physical':
+                                    return 'Evidence: physical stack frame';
+                                default:
+                                    return 'Evidence: unavailable';
+                            }
+                        }
+
+                        function formatChildHit(node) {
+                            if (!node) {
+                                return 'ChildHit: N/A';
+                            }
+                            var parent = node.child_hit_parent_symbol;
+                            var child = node.child_hit_child_symbol;
+                            if (parent || child) {
+                                return 'ChildHit: ' + valueOrNA(parent) + ' -> ' + valueOrNA(child);
+                            }
+                            var match = node.child_hit_match;
+                            if (match && match !== 'not_applicable') {
+                                return 'ChildHit: ' + match;
+                            }
+                            return 'ChildHit: ' + valueOrNA(match || 'not_applicable');
+                        }
+
+                        function appendDetail(info, text, extraClass) {
+                            var line = document.createElement('div');
+                            line.className = 'node-detail-line ' + (extraClass || '');
+                            line.textContent = text;
+                            info.appendChild(line);
+                        }
+
+                        function transitionNodeText(node) {
+                            var privilege = valueOrNA(node && node.privilege).toUpperCase();
+                            var type = valueOrNA(node && node.type);
+                            var label = (node && (node.label || node.func || node.event || node.symbol)) || 'unknown';
+                            if (node && node.type === 'transition') {
+                                return '[TRANSITION] ' + valueOrNA(node.event || node.label);
+                            }
+                            return '[' + privilege + '][' + type + '] ' + label;
+                        }
+
+                        function renderTransitionPath(path) {
+                            var container = document.getElementById('transitionChain');
+                            if (!container) {
+                                return;
+                            }
+                            container.innerHTML = '';
+                            container.style.display = 'block';
+                            var title = document.createElement('div');
+                            title.className = 'transition-chain-title';
+                            title.textContent = 'Cross Privilege Chain';
+                            container.appendChild(title);
+
+                            if (!Array.isArray(path) || path.length === 0) {
+                                var empty = document.createElement('div');
+                                empty.className = 'placeholder-text';
+                                empty.textContent = 'No cross privilege chain available.';
+                                container.appendChild(empty);
+                                return;
+                            }
+
+                            path.forEach(function(node, index) {
+                                if (index > 0) {
+                                    var arrow = document.createElement('div');
+                                    arrow.className = 'transition-chain-arrow';
+                                    arrow.textContent = '↓';
+                                    container.appendChild(arrow);
+                                }
+
+                                var row = document.createElement('div');
+                                row.className = 'transition-chain-node';
+                                row.textContent = transitionNodeText(node);
+                                row.addEventListener('click', function(event) {
+                                    event.stopPropagation();
+                                    if (window.ardInspectorVscode) {
+                                        window.ardInspectorVscode.postMessage({
+                                            command: 'selectNode',
+                                            cid: null,
+                                            func: node.func || node.label || node.event || '',
+                                            addr: node.pc || '',
+                                            file: node.file,
+                                            fullname: node.fullname,
+                                            line: node.line,
+                                        });
+                                    }
+                                });
+                                container.appendChild(row);
+                            });
+                        }
+
+                        function patchNode(node, treeNodeElement) {
+                            var info = treeNodeElement.querySelector(':scope > .node-content .node-info');
+                            var func = treeNodeElement.querySelector(':scope > .node-content .node-func');
+                            var meta = treeNodeElement.querySelector(':scope > .node-content .node-meta');
+                            var oldType = treeNodeElement.querySelector(':scope > .node-content .node-type');
+
+                            if (!info || !func || !meta) {
+                                return;
+                            }
+
+                            if (oldType) {
+                                oldType.style.display = 'none';
+                            }
+
+                            var oldBadges = info.querySelector(':scope > .node-badges');
+                            if (oldBadges) {
+                                oldBadges.remove();
+                            }
+                            var oldDetails = info.querySelectorAll(':scope > .node-detail-line');
+                            oldDetails.forEach(function(detail) { detail.remove(); });
+
+                            var badges = document.createElement('div');
+                            badges.className = 'node-badges';
+                            var typeText = node.type === 'async' ? 'ASYNC' : (node.type === 'transition' ? 'TRANSITION' : 'SYNC');
+                            addBadge(badges, typeText, node.type === 'async' ? 'async' : (node.type === 'sync' ? 'sync' : 'transition'));
+
+                            var privilege = node.privilege;
+                            if (privilege === 'kernel') {
+                                addBadge(badges, 'KERNEL', 'kernel');
+                            } else if (privilege === 'user') {
+                                addBadge(badges, 'USER', 'user');
+                            } else {
+                                addBadge(badges, 'PRIV:N/A', '');
+                            }
+
+                            addBadge(badges, originBadge(node), 'trace');
+                            var state = stateBadge(node);
+                            addBadge(badges, state.text, state.cls);
+                            var transition = transitionBadge(node);
+                            if (transition) {
+                                addBadge(badges, transition, 'transition');
+                            }
+
+                            info.insertBefore(badges, func);
+
+                            if (node.type === 'async') {
+                                meta.textContent =
+                                    'CID: ' + valueOrNA(node.cid) +
+                                    ' | Poll: ' + valueOrNA(node.poll) +
+                                    ' | State: ' + formatDisplayState(node) +
+                                    ' | StateRead: ' + valueOrNA(node.state_read_status);
+                            } else {
+                                meta.textContent = 'Addr: ' + valueOrNA(node.addr);
+                            }
+
+                            if (node.transition_event && node.transition_event !== 'none') {
+                                appendDetail(info, 'Transition: ' + node.transition_event);
+                            } else if (node.transition_event === 'none') {
+                                appendDetail(info, 'Transition: none');
+                            }
+                            appendDetail(info, formatEvidence(node));
+                            appendDetail(info, formatChildHit(node));
+                            if (node.state_read_error) {
+                                appendDetail(info, 'StateReadError: ' + node.state_read_error, 'node-detail-note');
+                            }
                         }
 
                         function formatDisplayState(node) {
@@ -795,38 +1496,73 @@ export class AsyncInspectorPanel {
 
                         function patchTreeMetadata(nodes) {
                             var flat = flattenTree(nodes || []);
-                            var metas = document.querySelectorAll('#treeContainer .tree-node .node-meta');
-                            metas.forEach(function(meta, index) {
+                            var treeNodes = document.querySelectorAll('#treeContainer .tree-node');
+                            treeNodes.forEach(function(treeNode, index) {
                                 var node = flat[index];
                                 if (!node) {
                                     return;
                                 }
-
-                                var origin = node.origin || 'unknown';
-                                var text = meta.textContent || '';
-                                text = text.replace(/\\s*\\|\\s*Origin:\\s*[^|]+$/, '');
-                                text = text.replace(/State:\\s*[^|]+/, 'State: ' + formatDisplayState(node));
-
-                                if ((origin === 'physical' || origin === 'inferred') && Number(node.poll) === 0) {
-                                    text = text.replace(/Poll:\\s*0\\b/, 'Poll: -');
-                                }
-
-                                meta.textContent = text + ' | Origin: ' + origin;
+                                patchNode(node, treeNode);
                             });
+                        }
+
+                        function scheduleInspectorPatch(nodes) {
+                            window.treeData = nodes || window.treeData || [];
+                            if (patchScheduled) {
+                                return;
+                            }
+                            patchScheduled = true;
+                            setTimeout(function() {
+                                patchScheduled = false;
+                                isPatching = true;
+                                try {
+                                    renderTransitionPath(window.transitionPath || []);
+                                    patchTreeMetadata(window.treeData || []);
+                                } finally {
+                                    isPatching = false;
+                                }
+                            }, 0);
                         }
 
                         window.addEventListener('message', function(event) {
                             var message = event.data;
                             if (message && message.command === 'updateTree') {
-                                setTimeout(function() {
-                                    patchTreeMetadata(message.treeData);
-                                }, 0);
+                                window.transitionPath = message.transitionPath || [];
+                                scheduleInspectorPatch(message.treeData);
+                            } else if (message && message.command === 'connectRemoteResult') {
+                                var button = document.getElementById('connectRemoteBtn');
+                                if (button) {
+                                    button.disabled = false;
+                                    button.textContent = 'Connect :1234';
+                                    button.title = message.message || '';
+                                }
                             }
                         });
 
-                        setTimeout(function() {
-                            patchTreeMetadata(window.treeData || []);
-                        }, 0);
+                        var connectRemoteBtn = document.getElementById('connectRemoteBtn');
+                        if (connectRemoteBtn) {
+                            connectRemoteBtn.addEventListener('click', function() {
+                                connectRemoteBtn.disabled = true;
+                                connectRemoteBtn.textContent = 'Connecting...';
+                                window.ardInspectorVscode.postMessage({
+                                    command: 'connectRemote',
+                                    host: '127.0.0.1',
+                                    port: 1234,
+                                });
+                            });
+                        }
+
+                        var treeContainer = document.getElementById('treeContainer');
+                        if (treeContainer && typeof MutationObserver !== 'undefined') {
+                            var observer = new MutationObserver(function() {
+                                if (!isPatching) {
+                                    scheduleInspectorPatch(window.treeData || []);
+                                }
+                            });
+                            observer.observe(treeContainer, { childList: true, subtree: true });
+                        }
+
+                        scheduleInspectorPatch(window.treeData || []);
                     })();
                 </script>
             </body>
@@ -836,6 +1572,7 @@ export class AsyncInspectorPanel {
     public dispose(): void {
         AsyncInspectorPanel.currentPanel = undefined;
         this._panel.dispose();
+        this._outputChannel.dispose();
         while (this._disposables.length) {
             const x = this._disposables.pop();
             if (x) {
@@ -846,7 +1583,7 @@ export class AsyncInspectorPanel {
 }
 
 interface TreeNode {
-    type: 'async' | 'sync';
+    type: 'async' | 'sync' | 'transition';
     cid: number | null;
     func: string;
     addr: string;

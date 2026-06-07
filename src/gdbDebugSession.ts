@@ -6,12 +6,26 @@ import * as fs from 'fs';
 /**
  * Snapshot data structure from ardb-get-snapshot command
  */
+export interface TransitionPathNode {
+    type?: 'sync' | 'transition' | 'async' | string;
+    privilege?: 'user' | 'kernel' | 'transition' | string;
+    func?: string;
+    symbol?: string;
+    label?: string;
+    event?: string;
+    pc?: string;
+    file?: string;
+    fullname?: string;
+    line?: number;
+}
+
 export interface SnapshotData {
     thread_id: number;
     privilege?: string;
     transition_event?: string;
     transition_symbol?: string;
     transition_pc?: string;
+    transition_path?: TransitionPathNode[];
     path: Array<{
         type: 'async' | 'sync';
         cid: number | null;
@@ -34,6 +48,12 @@ export interface SnapshotData {
         fullname?: string;
         line?: number;
     }>;
+}
+
+export interface RemoteConnectResult {
+    status: 'connected' | 'already-connected' | 'failed';
+    message: string;
+    detail?: string;
 }
 
 /**
@@ -193,7 +213,7 @@ export class GDBDebugSession {
      * Execute a GDB command via the debug session.
      * Note: This requires the debug adapter to support custom requests.
      */
-    async executeGDBCommand(command: string): Promise<string> {
+    async executeGDBCommand(command: string, suppressOutput: boolean = false): Promise<string> {
         if (!this.debugSession) {
             throw new Error('No active debug session');
         }
@@ -201,7 +221,7 @@ export class GDBDebugSession {
         try {
             const response = await this.debugSession.customRequest('evaluate', {
                 expression: command,
-                context: 'repl'
+                context: suppressOutput ? 'watch' : 'repl'
             });
             return response?.result || '';
         } catch (error) {
@@ -210,19 +230,82 @@ export class GDBDebugSession {
         }
     }
 
+    private async executeGDBCommandInternal(command: string): Promise<string> {
+        return this.executeGDBCommand(command, true);
+    }
+
+    /**
+     * Connect the active GDB process to a remote target without starting a
+     * second GDB process. Existing launch.json targetRemote support remains
+     * the preferred automatic path.
+     */
+    async connectRemote(target: string = ':1234'): Promise<RemoteConnectResult> {
+        if (!this.debugSession) {
+            return {
+                status: 'failed',
+                message: `[ARD] failed to connect remote target ${target}: no active debug session`,
+            };
+        }
+
+        let connectionState = await this.executeGDBCommandInternal(
+            'python import gdb; print(gdb.selected_inferior().connection)'
+        );
+        if (/attributeerror|python exception|undefined command|error while executing python/i.test(connectionState)) {
+            connectionState = await this.executeGDBCommandInternal('info target');
+        }
+        if (/RemoteTargetConnection|remote (?:serial )?target|remote debugging using|gdb-specific protocol|what="remote /i.test(connectionState)) {
+            const message = `[ARD] remote target already connected to ${target}`;
+            await this.writeDebugConsoleMessage(message);
+            return { status: 'already-connected', message };
+        }
+
+        const output = await this.executeGDBCommandInternal(`target remote ${target}`);
+        const failed = !output || /could not connect|connection refused|connection timed out|operation not permitted|no route to host|connection reset|remote communication error|command failed|not available|program is being debugged already/i.test(output);
+        if (failed) {
+            const detail = this.summarizeGDBError(output);
+            const message = `[ARD] failed to connect remote target ${target}: ${detail}`;
+            await this.writeDebugConsoleMessage(message);
+            return { status: 'failed', message, detail };
+        }
+
+        const message = `[ARD] connected to remote target ${target}`;
+        await this.writeDebugConsoleMessage(message);
+        return { status: 'connected', message };
+    }
+
+    private summarizeGDBError(output: string): string {
+        const lines = (output || '')
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .filter(Boolean);
+        const errorLine = [...lines].reverse().find(line =>
+            /could not connect|connection refused|connection timed out|operation not permitted|no route to host|connection reset|remote communication error|command failed|not available|program is being debugged already/i.test(line)
+        );
+        return (errorLine || lines[lines.length - 1] || 'no response from GDB')
+            .replace(/\s+/g, ' ')
+            .slice(0, 180);
+    }
+
+    private async writeDebugConsoleMessage(message: string): Promise<void> {
+        const escaped = message.replace(/\\/g, '\\\\');
+        await this.executeGDBCommand(`echo ${escaped}\\n`);
+    }
+
     /**
      * Get snapshot from GDB using ardb-get-snapshot command.
      * Parses the JSON directly from the evaluate response.
      */
-    async getSnapshot(): Promise<SnapshotData | undefined> {
+    async getSnapshot(suppressOutput: boolean = false): Promise<SnapshotData | undefined> {
         if (!this.debugSession) {
             console.warn('[GDBDebugSession] getSnapshot: no debug session');
             return undefined;
         }
 
         try {
-            const output = await this.executeGDBCommand('ardb-get-snapshot');
-            console.log('[GDBDebugSession] ardb-get-snapshot raw output length:', output.length, 'first 200 chars:', output.substring(0, 200));
+            const output = await this.executeGDBCommand('ardb-get-snapshot', suppressOutput);
+            if (!suppressOutput) {
+                console.log('[GDBDebugSession] ardb-get-snapshot raw output length:', output.length, 'first 200 chars:', output.substring(0, 200));
+            }
             if (!output) {
                 return this.lastSnapshot;
             }
