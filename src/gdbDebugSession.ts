@@ -19,13 +19,15 @@ export interface TransitionPathNode {
     line?: number;
 }
 
-export interface SnapshotData {
+export interface SnapshotContextData {
     thread_id: number;
     privilege?: string;
     transition_event?: string;
     transition_symbol?: string;
     transition_pc?: string;
-    transition_path?: TransitionPathNode[];
+}
+
+export interface SnapshotPathData extends SnapshotContextData {
     path: Array<{
         type: 'async' | 'sync';
         cid: number | null;
@@ -50,6 +52,14 @@ export interface SnapshotData {
     }>;
 }
 
+export interface TransitionChainData extends SnapshotContextData {
+    transition_path: TransitionPathNode[];
+}
+
+export interface SnapshotData extends SnapshotPathData {
+    transition_path: TransitionPathNode[];
+}
+
 export interface RemoteConnectResult {
     status: 'connected' | 'already-connected' | 'failed';
     message: string;
@@ -68,6 +78,8 @@ export class GDBDebugSession {
     private whitelistPath: string;
     private fileWatcher: vscode.FileSystemWatcher | undefined;
     private lastSnapshot: SnapshotData | undefined;
+    private lastSnapshotPath: SnapshotPathData | undefined;
+    private lastTransitionChain: TransitionChainData | undefined;
 
     constructor(context: vscode.ExtensionContext) {
         this.context = context;
@@ -330,6 +342,48 @@ export class GDBDebugSession {
             console.error('Failed to get snapshot:', error);
             return this.lastSnapshot;
         }
+    }
+
+    async getSnapshotPath(suppressOutput: boolean = false): Promise<SnapshotPathData | undefined> {
+        try {
+            const output = await this.executeGDBCommand('ardb-get-snapshot-path', suppressOutput);
+            const result = this.parseJSONResult<SnapshotPathData>(output);
+            if (result && result.thread_id !== undefined && Array.isArray(result.path)) {
+                this.lastSnapshotPath = result;
+                return result;
+            }
+            return this.lastSnapshotPath;
+        } catch (error) {
+            console.error('Failed to get snapshot path:', error);
+            return this.lastSnapshotPath;
+        }
+    }
+
+    async getTransitionChain(suppressOutput: boolean = false): Promise<TransitionChainData | undefined> {
+        try {
+            const output = await this.executeGDBCommand('ardb-get-transition-chain', suppressOutput);
+            const result = this.parseJSONResult<TransitionChainData>(output);
+            if (result && result.thread_id !== undefined && Array.isArray(result.transition_path)) {
+                this.lastTransitionChain = result;
+                return result;
+            }
+            return this.lastTransitionChain;
+        } catch (error) {
+            console.error('Failed to get transition chain:', error);
+            return this.lastTransitionChain;
+        }
+    }
+
+    private parseJSONResult<T>(output: string): T | undefined {
+        if (!output) {
+            return undefined;
+        }
+        const jsonStart = output.indexOf('{');
+        const jsonEnd = output.lastIndexOf('}');
+        if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+            return undefined;
+        }
+        return JSON.parse(output.substring(jsonStart, jsonEnd + 1)) as T;
     }
 
     /**

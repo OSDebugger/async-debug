@@ -68,6 +68,9 @@ class AsyncInspectorPanel {
                 case 'snapshot':
                     await this.handleSnapshot();
                     break;
+                case 'chain':
+                    await this.handleChainSnapshot();
+                    break;
                 case 'connectRemote':
                     await this.handleConnectRemote();
                     break;
@@ -121,7 +124,7 @@ class AsyncInspectorPanel {
             // No delay needed — the FIFO command queue in gdbAdapter
             // correctly routes console output even when MI commands
             // are in flight concurrently.
-            this.handleSnapshot(true).catch((e) => {
+            this.handleStoppedSnapshot().catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
         }
@@ -179,25 +182,68 @@ class AsyncInspectorPanel {
             vscode.window.showInformationMessage(`Tracing: ${symbol}`);
         }
     }
-    async handleSnapshot(suppressOutput = false) {
+    async fetchSnapshot(suppressOutput = false) {
         const session = this._debugAdapterFactory?.getActiveSession();
         if (!session) {
-            console.warn('[AsyncInspector] handleSnapshot: no GDB session from factory');
-            return;
+            console.warn('[AsyncInspector] fetchSnapshot: no GDB session from factory');
+            return undefined;
         }
         const snapshot = await session.getSnapshot(suppressOutput);
-        console.log('[AsyncInspector] handleSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
+        if (!suppressOutput) {
+            console.log('[AsyncInspector] fetchSnapshot: result =', snapshot ? `thread_id=${snapshot.thread_id}, path.length=${snapshot.path.length}` : 'null');
+        }
+        return snapshot;
+    }
+    async fetchSnapshotPath(suppressOutput = false) {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            console.warn('[AsyncInspector] fetchSnapshotPath: no GDB session from factory');
+            return undefined;
+        }
+        return session.getSnapshotPath(suppressOutput);
+    }
+    async fetchTransitionChain(suppressOutput = false) {
+        const session = this._debugAdapterFactory?.getActiveSession();
+        if (!session) {
+            console.warn('[AsyncInspector] fetchTransitionChain: no GDB session from factory');
+            return undefined;
+        }
+        return session.getTransitionChain(suppressOutput);
+    }
+    renderAsyncTreeFromSnapshot(snapshot) {
+        this._lastSnapshot = snapshot;
+        this.updateTreeFromSnapshot(snapshot);
+        this._panel.webview.postMessage({
+            command: 'updateTree',
+            treeData: Array.from(this._treeRoots.values()),
+        });
+    }
+    renderCrossPrivilegeChainFromSnapshot(snapshot) {
+        this._lastTransitionPath = Array.isArray(snapshot.transition_path)
+            ? snapshot.transition_path
+            : [];
+        this._panel.webview.postMessage({
+            command: 'updateTransitionPath',
+            transitionPath: this._lastTransitionPath,
+        });
+    }
+    async handleSnapshot() {
+        const snapshot = await this.fetchSnapshotPath(false);
         if (snapshot) {
-            this._lastSnapshot = snapshot;
-            this._lastTransitionPath = Array.isArray(snapshot.transition_path)
-                ? snapshot.transition_path
-                : [];
-            this.updateTreeFromSnapshot(snapshot);
-            this._panel.webview.postMessage({
-                command: 'updateTree',
-                treeData: Array.from(this._treeRoots.values()),
-                transitionPath: this._lastTransitionPath,
-            });
+            this.renderAsyncTreeFromSnapshot(snapshot);
+        }
+    }
+    async handleChainSnapshot() {
+        const snapshot = await this.fetchTransitionChain(false);
+        if (snapshot) {
+            this.renderCrossPrivilegeChainFromSnapshot(snapshot);
+        }
+    }
+    async handleStoppedSnapshot() {
+        const snapshot = await this.fetchSnapshot(true);
+        if (snapshot) {
+            this.renderAsyncTreeFromSnapshot(snapshot);
+            this.renderCrossPrivilegeChainFromSnapshot(snapshot);
         }
     }
     async handleSelectNode(nodeRef) {
@@ -1030,13 +1076,14 @@ class AsyncInspectorPanel {
             <body>
                 <div class="container">
                     <div class="toolbar">
+                        <button id="connectRemoteBtn" class="btn">Connect :1234</button>
                         <button id="resetBtn" class="btn">Reset</button>
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
                         <button id="snapshotBtn" class="btn">Snapshot</button>
-                        <button id="connectRemoteBtn" class="btn">Connect :1234</button>
+                        <button id="chainBtn" class="btn">Chain</button>
                     </div>
                     <div style="padding: 0 10px 10px; color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.4;">
-                        Snapshot reflects the current stopped execution context. Trace hits may not appear in the tree unless execution is stopped near the related poll/await site.
+                        Snapshot refreshes the current execution tree. Chain refreshes the cross-privilege transition path.
                     </div>
                     <div class="main-content">
                         <div class="tree-panel">
@@ -1344,7 +1391,6 @@ class AsyncInspectorPanel {
                                 patchScheduled = false;
                                 isPatching = true;
                                 try {
-                                    renderTransitionPath(window.transitionPath || []);
                                     patchTreeMetadata(window.treeData || []);
                                 } finally {
                                     isPatching = false;
@@ -1355,8 +1401,10 @@ class AsyncInspectorPanel {
                         window.addEventListener('message', function(event) {
                             var message = event.data;
                             if (message && message.command === 'updateTree') {
-                                window.transitionPath = message.transitionPath || [];
                                 scheduleInspectorPatch(message.treeData);
+                            } else if (message && message.command === 'updateTransitionPath') {
+                                window.transitionPath = message.transitionPath || [];
+                                renderTransitionPath(window.transitionPath);
                             } else if (message && message.command === 'connectRemoteResult') {
                                 var button = document.getElementById('connectRemoteBtn');
                                 if (button) {
@@ -1390,6 +1438,7 @@ class AsyncInspectorPanel {
                             observer.observe(treeContainer, { childList: true, subtree: true });
                         }
 
+                        renderTransitionPath(window.transitionPath || []);
                         scheduleInspectorPatch(window.treeData || []);
                     })();
                 </script>

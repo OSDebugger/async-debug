@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "name": "rel4-async",
+  "probes": [
+    {
+      "label": "syscall_test.rs:81",
+      "type": "sync",
+      "privilege": "user",
+      "location": "*0x1c580",
+      "location_env": "REL4_USER_START_ADDR",
+      "func": "example::syscall_test::async_syscall_test",
+      "file": "crates/example/src/syscall_test.rs",
+      "fullname": "/home/user/AsyncOS/rel4-manifest-workspace/projects/rust-root-task-demo/crates/example/src/syscall_test.rs",
+      "fullname_env": "REL4_ROOT_TASK_SRC",
+      "line": 81,
+      "message": "[1] [USER] syscall_test.rs:81"
+    },
+    {
+      "label": "syscall_test.rs:99/101",
+      "type": "sync",
+      "privilege": "user",
+      "location": "*0x1c626",
+      "location_env": "REL4_USER_REGISTER_ADDR",
+      "func": "example::syscall_test::async_syscall_test",
+      "file": "crates/example/src/syscall_test.rs",
+      "fullname": "/home/user/AsyncOS/rel4-manifest-workspace/projects/rust-root-task-demo/crates/example/src/syscall_test.rs",
+      "fullname_env": "REL4_ROOT_TASK_SRC",
+      "line": 101,
+      "message": "[2] [USER] syscall_test.rs:99/101"
+    },
+    {
+      "label": "syscall wrapper",
+      "type": "sync",
+      "privilege": "user",
+      "location": "*0x27d7a",
+      "location_env": "REL4_USER_WRAPPER_ADDR",
+      "func": "seL4_Uint_Notification_register_async_syscall",
+      "file": "",
+      "fullname": "",
+      "fullname_env": "REL4_USER_WRAPPER_SRC",
+      "line": 699,
+      "line_env": "REL4_USER_WRAPPER_LINE",
+      "message": "[3] [USER] syscall wrapper"
+    },
+    {
+      "label": "UintrRegisterAsyncSyscall label 33 / decode_invocation",
+      "type": "sync",
+      "privilege": "kernel",
+      "event": "user_to_kernel",
+      "location": "*0xffffffff84017ff8",
+      "location_env": "REL4_KERNEL_LABEL33_ADDR",
+      "func": "rustlib::syscall::invocation::decode::decode_invocation",
+      "file": "src/syscall/invocation/decode/mod.rs",
+      "fullname": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/src/syscall/invocation/decode/mod.rs",
+      "fullname_env": "REL4_KERNEL_SRC",
+      "line": 93,
+      "event_message": "[4] [TRANSITION] user_to_kernel",
+      "message": "[5] [KERNEL] UintrRegisterAsyncSyscall label 33 / decode_invocation"
+    },
+    {
+      "label": "async_syscall_handler spawn site",
+      "type": "sync",
+      "privilege": "kernel",
+      "location": "*0xffffffff84018042",
+      "location_env": "REL4_KERNEL_SPAWN_ADDR",
+      "func": "rustlib::syscall::invocation::decode::decode_invocation",
+      "file": "src/syscall/invocation/decode/mod.rs",
+      "fullname": "/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/src/syscall/invocation/decode/mod.rs",
+      "fullname_env": "REL4_KERNEL_SRC",
+      "line": 100,
+      "message": "[6] [KERNEL] async_syscall_handler spawn site"
+    }
+  ]
+}

@@ -23,6 +23,10 @@
         document.getElementById('snapshotBtn').addEventListener('click', () => {
             vscode.postMessage({ command: 'snapshot' });
         });
+
+        document.getElementById('chainBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'chain' });
+        });
     }
 
     function renderTree(roots) {

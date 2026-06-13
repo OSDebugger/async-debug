@@ -267,6 +267,47 @@ class GDBDebugSession {
             return this.lastSnapshot;
         }
     }
+    async getSnapshotPath(suppressOutput = false) {
+        try {
+            const output = await this.executeGDBCommand('ardb-get-snapshot-path', suppressOutput);
+            const result = this.parseJSONResult(output);
+            if (result && result.thread_id !== undefined && Array.isArray(result.path)) {
+                this.lastSnapshotPath = result;
+                return result;
+            }
+            return this.lastSnapshotPath;
+        }
+        catch (error) {
+            console.error('Failed to get snapshot path:', error);
+            return this.lastSnapshotPath;
+        }
+    }
+    async getTransitionChain(suppressOutput = false) {
+        try {
+            const output = await this.executeGDBCommand('ardb-get-transition-chain', suppressOutput);
+            const result = this.parseJSONResult(output);
+            if (result && result.thread_id !== undefined && Array.isArray(result.transition_path)) {
+                this.lastTransitionChain = result;
+                return result;
+            }
+            return this.lastTransitionChain;
+        }
+        catch (error) {
+            console.error('Failed to get transition chain:', error);
+            return this.lastTransitionChain;
+        }
+    }
+    parseJSONResult(output) {
+        if (!output) {
+            return undefined;
+        }
+        const jsonStart = output.indexOf('{');
+        const jsonEnd = output.lastIndexOf('}');
+        if (jsonStart === -1 || jsonEnd === -1 || jsonEnd <= jsonStart) {
+            return undefined;
+        }
+        return JSON.parse(output.substring(jsonStart, jsonEnd + 1));
+    }
     /**
      * Execute ardb-reset command.
      */

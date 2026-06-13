@@ -7,11 +7,11 @@ USER_ELF=${USER_ELF:-/home/user/AsyncOS/rel4-manifest-workspace/rel4_kernel/buil
 GDB=${GDB:-gdb-multiarch}
 REMOTE=${REMOTE:-:1234}
 TIMEOUT=${TIMEOUT:-240}
+TRANSITION_PROBE_CONFIG=${TRANSITION_PROBE_CONFIG:-$ROOT/testcases/rel4-async/transition-probe.json}
 
 USER_TEXT_ADDR=${USER_TEXT_ADDR:-0x1ab3c}
 USER_START_ADDR=${USER_START_ADDR:-0x1c580}
 USER_REGISTER_ADDR=${USER_REGISTER_ADDR:-0x1c626}
-USER_CALL_ADDR=${USER_CALL_ADDR:-0x1c6a2}
 USER_WRAPPER_ADDR=${USER_WRAPPER_ADDR:-0x27d7a}
 KERNEL_LABEL33_ADDR=${KERNEL_LABEL33_ADDR:-0xffffffff84017ff8}
 KERNEL_SPAWN_ADDR=${KERNEL_SPAWN_ADDR:-0xffffffff84018042}
@@ -34,12 +34,6 @@ set breakpoint pending on
 set architecture riscv:rv64
 set python print-stack full
 
-set \$hit_user_start = 0
-set \$hit_user_register = 0
-set \$hit_user_call = 0
-set \$hit_user_wrapper = 0
-set \$hit_kernel_label = 0
-set \$hit_async_spawn = 0
 set \$hit_coroutine = 0
 set \$hit_async_handler = 0
 
@@ -55,72 +49,10 @@ ardb-load-whitelist $ROOT/temp/poll_functions.txt
 add-symbol-file $USER_ELF $USER_TEXT_ADDR
 
 echo \n===== REL4 ASYNC PRIVILEGE CHAIN =====\n
+ardb-enable-transition-probe $TRANSITION_PROBE_CONFIG
+ardb-transition-probe-status
 ardb-trace '$COROUTINE_SYMBOL'
 ardb-trace '$ASYNC_HANDLER_SYMBOL'
-
-break *$USER_START_ADDR
-commands
-  silent
-  set \$hit_user_start = \$hit_user_start + 1
-  echo \n[1] [USER][sync] syscall_test.rs:81 - async syscall test setup\n
-  ardb-transition-add sync|user|syscall_test.rs:81|example::syscall_test::async_syscall_test
-  disable \$_hit_bpnum
-  continue
-end
-
-break *$USER_REGISTER_ADDR
-commands
-  silent
-  set \$hit_user_register = \$hit_user_register + 1
-  echo \n[2] [USER][sync] syscall_test.rs:99/101 - register async syscall buffer vicinity\n
-  ardb-transition-add sync|user|syscall_test.rs:99/101|example::syscall_test::async_syscall_test
-  disable \$_hit_bpnum
-  continue
-end
-
-break *$USER_CALL_ADDR
-commands
-  silent
-  set \$hit_user_call = \$hit_user_call + 1
-  if \$hit_user_register == 0
-    echo \n[2] [USER][sync] syscall_test.rs:104 - register async syscall call site\n
-    ardb-transition-add sync|user|syscall_test.rs:104|example::syscall_test::async_syscall_test
-  end
-  disable \$_hit_bpnum
-  continue
-end
-
-break *$USER_WRAPPER_ADDR
-commands
-  silent
-  set \$hit_user_wrapper = \$hit_user_wrapper + 1
-  echo \n[3] [USER][sync] syscall wrapper - seL4_Uint_Notification_register_async_syscall\n
-  ardb-transition-add sync|user|syscall wrapper|seL4_Uint_Notification_register_async_syscall
-  disable \$_hit_bpnum
-  continue
-end
-
-break *$KERNEL_LABEL33_ADDR
-commands
-  silent
-  set \$hit_kernel_label = \$hit_kernel_label + 1
-  echo \n[4] [TRANSITION] user_to_kernel transition_event=user_to_kernel\n
-  ardb-transition-event user_to_kernel
-  echo [5] [KERNEL][sync] UintrRegisterAsyncSyscall label 33 / decode_invocation\n
-  ardb-transition-add sync|kernel|UintrRegisterAsyncSyscall label 33 / decode_invocation|rustlib::syscall::invocation::decode::decode_invocation
-  disable \$_hit_bpnum
-  continue
-end
-
-break *$KERNEL_SPAWN_ADDR
-commands
-  silent
-  set \$hit_async_spawn = \$hit_async_spawn + 1
-  echo \n[6] [KERNEL][sync] async_syscall_handler spawn site\n
-  ardb-transition-add sync|kernel|async_syscall_handler spawn site|rustlib::syscall::invocation::decode::decode_invocation
-  disable \$_hit_bpnum
-  continue
-end
 
 break '$COROUTINE_SYMBOL'
 commands
@@ -132,14 +64,10 @@ commands
   disable \$_hit_bpnum
   if \$hit_async_handler >= 1
     echo \n===== REL4 ASYNC PRIVILEGE CHAIN SUMMARY =====\n
-    printf "hit_user_start=%d\\n", \$hit_user_start
-    printf "hit_user_register=%d\\n", \$hit_user_register
-    printf "hit_user_call=%d\\n", \$hit_user_call
-    printf "hit_user_wrapper=%d\\n", \$hit_user_wrapper
-    printf "hit_kernel_label=%d\\n", \$hit_kernel_label
-    printf "hit_async_spawn=%d\\n", \$hit_async_spawn
     printf "hit_coroutine=%d\\n", \$hit_coroutine
     printf "hit_async_handler=%d\\n", \$hit_async_handler
+    echo \n===== TRANSITION PROBE STATUS =====\n
+    ardb-transition-probe-status
     echo \n===== TRANSITION PATH STATUS =====\n
     ardb-transition-status
     echo \n===== FINAL ARD SNAPSHOT =====\n
@@ -161,14 +89,10 @@ commands
   disable \$_hit_bpnum
   if \$hit_coroutine >= 1
     echo \n===== REL4 ASYNC PRIVILEGE CHAIN SUMMARY =====\n
-    printf "hit_user_start=%d\\n", \$hit_user_start
-    printf "hit_user_register=%d\\n", \$hit_user_register
-    printf "hit_user_call=%d\\n", \$hit_user_call
-    printf "hit_user_wrapper=%d\\n", \$hit_user_wrapper
-    printf "hit_kernel_label=%d\\n", \$hit_kernel_label
-    printf "hit_async_spawn=%d\\n", \$hit_async_spawn
     printf "hit_coroutine=%d\\n", \$hit_coroutine
     printf "hit_async_handler=%d\\n", \$hit_async_handler
+    echo \n===== TRANSITION PROBE STATUS =====\n
+    ardb-transition-probe-status
     echo \n===== TRANSITION PATH STATUS =====\n
     ardb-transition-status
     echo \n===== FINAL ARD SNAPSHOT =====\n
@@ -183,14 +107,10 @@ end
 continue
 
 echo \n===== REL4 ASYNC PRIVILEGE CHAIN SUMMARY =====\n
-printf "hit_user_start=%d\\n", \$hit_user_start
-printf "hit_user_register=%d\\n", \$hit_user_register
-printf "hit_user_call=%d\\n", \$hit_user_call
-printf "hit_user_wrapper=%d\\n", \$hit_user_wrapper
-printf "hit_kernel_label=%d\\n", \$hit_kernel_label
-printf "hit_async_spawn=%d\\n", \$hit_async_spawn
 printf "hit_coroutine=%d\\n", \$hit_coroutine
 printf "hit_async_handler=%d\\n", \$hit_async_handler
+echo \n===== TRANSITION PROBE STATUS =====\n
+ardb-transition-probe-status
 echo \n===== TRANSITION PATH STATUS =====\n
 ardb-transition-status
 echo \n===== FINAL ARD SNAPSHOT =====\n
@@ -206,6 +126,11 @@ cd "$ROOT"
 set +e
 PYTHONPATH="$ROOT" \
 ASYNC_RUST_DEBUGGER_TEMP_DIR="$ROOT/temp" \
+REL4_USER_START_ADDR="$USER_START_ADDR" \
+REL4_USER_REGISTER_ADDR="$USER_REGISTER_ADDR" \
+REL4_USER_WRAPPER_ADDR="$USER_WRAPPER_ADDR" \
+REL4_KERNEL_LABEL33_ADDR="$KERNEL_LABEL33_ADDR" \
+REL4_KERNEL_SPAWN_ADDR="$KERNEL_SPAWN_ADDR" \
 timeout "$TIMEOUT"s "$GDB" -q "$KERNEL" -x "$GDB_SCRIPT" 2>&1 | tee "$LOG"
 STATUS=${PIPESTATUS[0]}
 set -e
@@ -271,15 +196,16 @@ if snapshot:
 
 child_hit = contains("child-hit")
 caller_hit = contains("caller-frame-hit")
-hit_user_wrapper = hit_count("hit_user_wrapper") > 0 or contains("[3] [USER] syscall wrapper")
-hit_kernel_label = hit_count("hit_kernel_label") > 0 or contains("[5] [KERNEL] UintrRegisterAsyncSyscall")
-hit_user_start = hit_count("hit_user_start") > 0 or contains("[1] [USER][sync] syscall_test.rs:81")
-hit_user_register = (
-    hit_count("hit_user_register") > 0
-    or hit_count("hit_user_call") > 0
-    or contains("[2] [USER][sync] syscall_test.rs")
-)
-hit_async_spawn = hit_count("hit_async_spawn") > 0 or contains("[6] [KERNEL][sync] async_syscall_handler spawn site")
+transition_labels = {
+    str(node.get("label", ""))
+    for node in transition_path
+    if isinstance(node, dict)
+}
+hit_user_wrapper = "syscall wrapper" in transition_labels
+hit_kernel_label = "UintrRegisterAsyncSyscall label 33 / decode_invocation" in transition_labels
+hit_user_start = "syscall_test.rs:81" in transition_labels
+hit_user_register = "syscall_test.rs:99/101" in transition_labels
+hit_async_spawn = "async_syscall_handler spawn site" in transition_labels
 hit_coroutine = hit_count("hit_coroutine") > 0 or contains("[7] [KERNEL ASYNC] Coroutine::execute")
 hit_async_handler = hit_count("hit_async_handler") > 0 or contains("[8] [KERNEL ASYNC] async_syscall_handler")
 chain_observed = hit_user_wrapper and hit_kernel_label and hit_coroutine and hit_async_handler
@@ -322,17 +248,12 @@ lines = [
     "## Hit Counts",
     "",
 ]
-for key in [
-    "hit_user_start",
-    "hit_user_register",
-    "hit_user_call",
-    "hit_user_wrapper",
-    "hit_kernel_label",
-    "hit_async_spawn",
-    "hit_coroutine",
-    "hit_async_handler",
-]:
+for key in ["hit_coroutine", "hit_async_handler"]:
     lines.append(f"- {key}: {hit_count(key)}")
+lines += [
+    f"- transition probe nodes observed: {len(transition_path)}",
+    f"- configured boundary labels observed: {len(transition_labels)}",
+]
 
 lines += ["", "## Snapshot", ""]
 
@@ -377,7 +298,7 @@ lines += [
     "- Ordinary GDB backtrace does not automatically stitch a cross-privilege logical stack.",
     "- This script reconstructs the chain from breakpoint hit order.",
     "- This script does not implement multi-HART or multi-thread precise correlation.",
-    "- `transition_path` is recorded by explicit `ardb-transition-*` commands in this probe.",
+    "- `transition_path` is recorded by `ardb-enable-transition-probe` using transition-probe.json.",
     "- Ordinary `run_snapshot_probe.sh` snapshots may not include `transition_path`.",
     "- Inspector displays the cross-privilege chain only when the snapshot contains `transition_path`.",
 ]
