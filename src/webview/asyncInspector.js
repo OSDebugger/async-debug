@@ -1,6 +1,8 @@
 (function() {
     const vscode = acquireVsCodeApi();
     let treeData = window.treeData || [];
+    let currentTreeMode = window.treeMode === 'snapshot' ? 'snapshot' : 'observer';
+    let viewRequestId = window.treeViewRequestId || 0;
     let selectedNode = null;
 
     // Grouped whitelist state
@@ -8,8 +10,8 @@
     let enabledCrates = new Set();
     let asyncOnly = false;
 
-    // Observer is a view over History and therefore has one selected root.
-    let observerRoot = null;
+    // Observer projects the cumulative History Store from the selected Trace Root.
+    let observerRoot = window.observerRoot || null;
 
     // Flat candidates fallback
     let candidates = [];
@@ -25,6 +27,9 @@
 
     function setupEventListeners() {
         document.getElementById('resetBtn').addEventListener('click', () => {
+            currentTreeMode = 'observer';
+            ++viewRequestId;
+            selectedNode = null;
             observerRoot = null;
             treeData = [];
             groupedWhitelist = null;
@@ -34,7 +39,7 @@
             renderTreeViewState();
             renderTree(treeData);
             renderGroupedWhitelist(null);
-            vscode.postMessage({ command: 'reset' });
+            vscode.postMessage({ command: 'reset', viewRequestId });
         });
 
         document.getElementById('genWhitelistBtn').addEventListener('click', () => {
@@ -42,20 +47,37 @@
         });
 
         document.getElementById('snapshotBtn').addEventListener('click', () => {
-            vscode.postMessage({ command: 'snapshot' });
+            selectTreeMode('snapshot');
+            vscode.postMessage({ command: 'snapshot', viewRequestId });
         });
 
         document.getElementById('observerBtn').addEventListener('click', () => {
-            vscode.postMessage({ command: 'refreshObserver' });
+            selectTreeMode('observer');
+            vscode.postMessage({ command: 'refreshObserver', viewRequestId });
         });
+
+        document.getElementById('clearHistoryBtn').addEventListener('click', () => {
+            vscode.postMessage({ command: 'clearHistory' });
+        });
+    }
+
+    function selectTreeMode(mode) {
+        currentTreeMode = mode;
+        ++viewRequestId;
+        treeData = [];
+        selectedNode = null;
+        renderTreeViewState();
+        renderTree(treeData);
     }
 
     function renderTreeViewState() {
         const observerBtn = document.getElementById('observerBtn');
+        const snapshotBtn = document.getElementById('snapshotBtn');
         const title = document.getElementById('treeViewTitle');
-        observerBtn?.classList.add('active');
+        observerBtn?.classList.toggle('active', currentTreeMode === 'observer');
+        snapshotBtn?.classList.toggle('active', currentTreeMode === 'snapshot');
         if (title) {
-            title.textContent = 'Execution Graph';
+            title.textContent = `Async Inspector — ${currentTreeMode === 'observer' ? 'Observer' : 'Snapshot'}`;
         }
     }
 
@@ -68,7 +90,9 @@
         container.innerHTML = '';
 
         if (roots.length === 0) {
-            container.innerHTML = '<div class="placeholder-text">No execution graph available. Select a Trace Root from the whitelist.</div>';
+            container.innerHTML = currentTreeMode === 'observer'
+                ? '<div class="placeholder-text">No Observer tree available. Select a Trace Root from the whitelist.</div>'
+                : '<div class="placeholder-text">No Snapshot tree available. Pause the program and click Snapshot.</div>';
             return;
         }
 
@@ -111,6 +135,9 @@
                 command: 'selectNode',
                 cid: node.cid,
                 symbol: node.func,
+                snapshotIndex: node.snapshotIndex,
+                mode: currentTreeMode,
+                viewRequestId,
             });
         });
 
@@ -401,12 +428,17 @@
         const message = event.data;
         switch (message.command) {
             case 'updateTreeView':
+                if (message.viewRequestId !== undefined && message.viewRequestId !== viewRequestId) break;
                 observerRoot = message.observerRoot || null;
                 renderTreeViewState();
                 renderObserverRoot();
                 break;
             case 'updateTree':
+                // Already-posted replies can arrive after another click, even
+                // when the user has returned to the same mode.
+                if (message.mode !== currentTreeMode || message.viewRequestId !== viewRequestId) break;
                 treeData = message.treeData || [];
+                selectedNode = null;
                 renderTree(treeData);
                 break;
             case 'updateCandidates':

@@ -11,6 +11,7 @@ import {
 } from '../runtimeTraceBridge';
 
 type RuntimeObserverNode = ObserverTreeData['roots'][number];
+type AsyncTreeMode = 'observer' | 'snapshot';
 
 /**
  * Async Inspector Panel - Webview for displaying async execution trees
@@ -24,12 +25,19 @@ export class AsyncInspectorPanel {
     private _observerTreeRoots: TreeNode[] = [];
     private _observerRelationAnnotations: HistoryRelationAnnotation[] = [];
     private _observerRoot: string | null = null;
-    /** Cache of the last snapshot, used by selectNode to find frame indices. */
+    private _currentTreeMode: AsyncTreeMode = 'observer';
+    private _snapshotTreeRoots: TreeNode[] = [];
+    private _snapshotRequestId = 0;
+    private _observerRequestId = 0;
+    private _treeViewRequestId = 0;
+    /** Detached current-state projection; never used to populate the History Store. */
     private _lastSnapshot: SnapshotV1 | undefined;
 
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
         this._panel = panel;
         this._extensionUri = extensionUri;
+        const session = vscode.debug.activeDebugSession;
+        this._debugSession = session?.type === 'ardb' ? session : undefined;
 
         // Set the webview's initial html content
         this._update();
@@ -42,7 +50,7 @@ export class AsyncInspectorPanel {
             async (message) => {
                 switch (message.command) {
                     case 'reset':
-                        await this.handleReset();
+                        await this.handleReset(message.viewRequestId);
                         break;
                     case 'genWhitelist':
                         await this.handleGenWhitelist();
@@ -51,13 +59,20 @@ export class AsyncInspectorPanel {
                         await this.handleTrace(message.symbol);
                         break;
                     case 'snapshot':
-                        await this.handleSnapshot();
+                        await this.handleSnapshot(message.viewRequestId);
                         break;
                     case 'refreshObserver':
+                        this._currentTreeMode = 'observer';
+                        this._treeViewRequestId = message.viewRequestId;
                         await this.fetchObserverTree();
                         break;
+                    case 'clearHistory':
+                        await this.handleClearHistory();
+                        break;
                     case 'selectNode':
-                        await this.handleSelectNode(message.cid, message.symbol);
+                        if (message.viewRequestId === this._treeViewRequestId) {
+                            await this.handleSelectNode(message.cid, message.symbol, message.snapshotIndex, message.mode);
+                        }
                         break;
                     case 'locate':
                         await this.handleLocate(message.symbol);
@@ -76,7 +91,7 @@ export class AsyncInspectorPanel {
 
         // Listen for debug session changes
         vscode.debug.onDidChangeActiveDebugSession((session) => {
-            this._debugSession = session?.type === 'ardb' ? session : undefined;
+            this.setDebugSession(session?.type === 'ardb' ? session : undefined);
         }, null, this._disposables);
     }
 
@@ -113,15 +128,15 @@ export class AsyncInspectorPanel {
 
     /**
      * Called when the debug adapter sends a "stopped" event.
-     * Snapshot is intentionally manual during RuntimeEventGraph validation;
-     * only the selected Observer view refreshes on a real stop.
+     * Snapshot refresh is manual; only Observer mode refreshes its
+     * Trace Root projection of the History Store on a non-entry stop.
      */
     public onDebugStopped(session: vscode.DebugSession, stoppedBody: any): void {
-        this._debugSession = session;
+        this.setDebugSession(session);
         const isEntry = stoppedBody?.reason === 'entry';
         console.log(`[AsyncInspector] onDebugStopped reason=${stoppedBody?.reason} isEntry=${isEntry} hasSession=${!!this._debugSession}`);
 
-        if (!isEntry) {
+        if (!isEntry && this._currentTreeMode === 'observer') {
             this.refreshStoppedState().catch((e) => {
                 console.error('[AsyncInspector] onDebugStopped handlers failed:', e);
             });
@@ -132,13 +147,34 @@ export class AsyncInspectorPanel {
         await this.fetchObserverTree();
     }
 
-    private async handleReset(): Promise<void> {
+    private setDebugSession(session: vscode.DebugSession | undefined): void {
+        if (this._debugSession === session) {
+            return;
+        }
+        this._debugSession = session;
+        ++this._snapshotRequestId;
+        ++this._observerRequestId;
+        this._lastSnapshot = undefined;
+        this._snapshotTreeRoots = [];
+        this._observerTreeRoots = [];
+        this._observerRelationAnnotations = [];
+        this._observerRoot = null;
+        this.postTree();
+    }
+
+    private async handleReset(viewRequestId: number): Promise<void> {
+        ++this._snapshotRequestId;
+        ++this._observerRequestId;
+        this._currentTreeMode = 'observer';
+        this._treeViewRequestId = viewRequestId;
+        this._lastSnapshot = undefined;
+        this._snapshotTreeRoots = [];
+        this._observerTreeRoots = [];
+        this._observerRelationAnnotations = [];
+        this._observerRoot = null;
+        this.postTree();
         if (this._debugSession) {
             await this._debugSession.customRequest('ardb-reset');
-            this._lastSnapshot = undefined;
-            this._observerTreeRoots = [];
-            this._observerRelationAnnotations = [];
-            this._observerRoot = null;
             this._update();
             vscode.window.showInformationMessage('ARD reset completed');
         }
@@ -166,42 +202,99 @@ export class AsyncInspectorPanel {
         }
     }
 
-    private async handleSnapshot(): Promise<void> {
-        if (!this._debugSession) {
+    private async handleSnapshot(viewRequestId: number): Promise<void> {
+        this._currentTreeMode = 'snapshot';
+        this._treeViewRequestId = viewRequestId;
+        const requestId = ++this._snapshotRequestId;
+        const session = this._debugSession;
+        this._lastSnapshot = undefined;
+        this._snapshotTreeRoots = [];
+        this.postTree('snapshot');
+        if (!session) {
             console.warn('[AsyncInspector] handleSnapshot: no debug session');
             return;
         }
 
-        const result = await this._debugSession.customRequest('ardb-get-snapshot');
-        const snapshot = result?.snapshot as SnapshotV1 | null | undefined;
-        console.log(
-            '[AsyncInspector] handleSnapshot: snapshot JSON =',
-            JSON.stringify(snapshot ?? null)
-        );
-
-        this._lastSnapshot = snapshot && !snapshot.empty ? snapshot : undefined;
+        try {
+            const result = await session.customRequest('ardb-get-snapshot');
+            if (requestId !== this._snapshotRequestId || session !== this._debugSession) {
+                return;
+            }
+            const snapshot = result?.snapshot as SnapshotV1 | null | undefined;
+            this._lastSnapshot = snapshot && !snapshot.empty ? snapshot : undefined;
+            this._snapshotTreeRoots = this._lastSnapshot
+                ? buildCurrentExecutionForest(this._lastSnapshot)
+                : [];
+            this.postTree('snapshot');
+        } catch (error) {
+            if (requestId === this._snapshotRequestId && session === this._debugSession
+                && this._currentTreeMode === 'snapshot') {
+                vscode.window.showWarningMessage(`Cannot refresh Snapshot: ${error}`);
+            }
+        }
     }
 
     private async fetchObserverTree(): Promise<void> {
-        if (!this._debugSession) {
+        const requestId = ++this._observerRequestId;
+        const session = this._debugSession;
+        this._observerTreeRoots = [];
+        this._observerRelationAnnotations = [];
+        this.postTree('observer');
+        if (!session) {
             console.warn('[AsyncInspector] fetchObserverTree: no debug session');
             return;
         }
 
-        const response = await this._debugSession.customRequest('ardb-get-observer-tree');
-        const observerTree = response?.observerTree as ObserverTreeData | undefined;
-        this._observerTreeRoots = observerTree && Array.isArray(observerTree.roots)
-            ? this.normalizeRuntimeObserverNodes(observerTree.roots)
-            : [];
-        this._observerRelationAnnotations = observerTree
-            && Array.isArray(observerTree.relation_annotations)
-            ? observerTree.relation_annotations.map(annotation => ({
-                ...annotation,
-                relation: { ...annotation.relation },
-            }))
-            : [];
-        this._observerRoot = observerTree?.observer_root || null;
-        this.postObserverTree();
+        try {
+            const response = await session.customRequest('ardb-get-observer-tree');
+            if (requestId !== this._observerRequestId || session !== this._debugSession) {
+                return;
+            }
+            const observerTree = response?.observerTree as ObserverTreeData | undefined;
+            this._observerTreeRoots = observerTree && Array.isArray(observerTree.roots)
+                ? this.normalizeRuntimeObserverNodes(observerTree.roots)
+                : [];
+            this._observerRelationAnnotations = observerTree
+                && Array.isArray(observerTree.relation_annotations)
+                ? observerTree.relation_annotations.map(annotation => ({
+                    ...annotation,
+                    relation: { ...annotation.relation },
+                }))
+                : [];
+            this._observerRoot = observerTree?.observer_root || null;
+            this.postTree('observer');
+        } catch (error) {
+            if (requestId === this._observerRequestId && session === this._debugSession
+                && this._currentTreeMode === 'observer') {
+                vscode.window.showWarningMessage(`Cannot refresh Observer: ${error}`);
+            }
+        }
+    }
+
+    private async handleClearHistory(): Promise<void> {
+        const session = this._debugSession;
+        if (!session) {
+            return;
+        }
+        ++this._observerRequestId;
+        try {
+            await session.customRequest('ardb-clear-history-tree');
+            if (session !== this._debugSession) {
+                return;
+            }
+            // Also invalidate Observer reads started while Clear History was pending.
+            ++this._observerRequestId;
+            this._observerTreeRoots = [];
+            this._observerRelationAnnotations = [];
+            this._observerRoot = null;
+            this._panel.webview.postMessage({
+                command: 'updateTreeView',
+                observerRoot: this._observerRoot,
+            });
+            this.postTree('observer');
+        } catch (error) {
+            vscode.window.showWarningMessage(`Cannot clear History: ${error}`);
+        }
     }
 
     private normalizeRuntimeObserverNodes(nodes: RuntimeObserverNode[]): TreeNode[] {
@@ -227,81 +320,57 @@ export class AsyncInspectorPanel {
         }));
     }
 
-    private postObserverTree(): void {
+    private postTree(mode: AsyncTreeMode = this._currentTreeMode): void {
+        if (mode !== this._currentTreeMode) {
+            return;
+        }
         this._panel.webview.postMessage({
             command: 'updateTreeView',
-            view: 'observer',
+            mode,
+            viewRequestId: this._treeViewRequestId,
             observerRoot: this._observerRoot,
         });
         this._panel.webview.postMessage({
             command: 'updateTree',
-            treeData: this._observerTreeRoots,
+            mode,
+            viewRequestId: this._treeViewRequestId,
+            treeData: mode === 'observer' ? this._observerTreeRoots : this._snapshotTreeRoots,
         });
     }
 
-    private async handleSelectNode(cid: number | null, symbol?: string): Promise<void> {
-        if (!this._debugSession) {
+    private async handleSelectNode(
+        cid: number | null,
+        symbol?: string,
+        snapshotIndex?: number,
+        mode?: AsyncTreeMode,
+    ): Promise<void> {
+        if (!this._debugSession || (mode && mode !== this._currentTreeMode)) {
             return;
         }
 
-        const snapshot = this._lastSnapshot;
-        if (snapshot && cid !== null) {
-            // Find the frame index from the original Snapshot path, not tree depth.
-            let targetFrameIndex = -1;
-            for (let i = 0; i < snapshot.async_path.length; i++) {
-                const node = snapshot.async_path[i];
-                if (node.kind === 'async' && node.cid === cid) {
-                    targetFrameIndex = snapshot.async_path.length - 1 - i;
-                    break;
-                }
-            }
-
-            if (targetFrameIndex >= 0) {
-                try {
-                    const stackTrace = await this._debugSession.customRequest('stackTrace', {
-                        threadId: snapshot.thread_id,
-                        startFrame: 0,
-                        levels: 200,
-                    });
-
-                    const frames = stackTrace?.stackFrames || [];
-                    if (frames.length > targetFrameIndex) {
-                        const frame = frames[targetFrameIndex];
-
-                        await this._debugSession.customRequest('evaluate', {
-                            expression: `frame ${targetFrameIndex}`,
-                            context: 'repl',
-                        });
-
-                        if (frame.source?.path) {
-                            await this.handleSelectFrame(frame.source.path, frame.line || 0);
-                            return;
-                        }
-                    }
-                } catch (error) {
-                    console.error('Failed to switch frame:', error);
-                }
-            }
-        }
-
-        // Observer nodes outlive the current Snapshot. Reuse the existing GDB
-        // symbol locator for sync nodes and stale/non-current async instances.
-        if (typeof symbol === 'string' && symbol) {
-            const observerNode = this.findObserverNode(symbol);
-            await this.handleLocate(symbol, observerNode?.addr);
-        }
-    }
-
-    private findObserverNode(symbol: string): TreeNode | undefined {
-        const pending = [...this._observerTreeRoots];
+        const pending = [...(this._currentTreeMode === 'snapshot'
+            ? this._snapshotTreeRoots : this._observerTreeRoots)];
         while (pending.length > 0) {
             const node = pending.pop()!;
-            if (node.func === symbol) {
-                return node;
+            if (node.func === symbol && node.cid === cid
+                && (this._currentTreeMode === 'observer' || node.snapshotIndex === snapshotIndex)) {
+                // A manually captured Snapshot can outlive its stop. Use its
+                // source location, never interpret its path index as a live frame.
+                const source = node.source as SnapshotPathNodeV1['source'];
+                if (this._currentTreeMode === 'snapshot' && source?.path) {
+                    const localPath = resolveTestcaseSourcePath(
+                        source.path, this.testcaseSourceRoots(), message => console.debug(message),
+                    );
+                    if (localPath) {
+                        await this.handleSelectFrame(localPath, source.line || 0);
+                        return;
+                    }
+                }
+                await this.handleLocate(node.func, node.addr);
+                return;
             }
             pending.push(...node.children);
         }
-        return undefined;
     }
 
     private testcaseSourceRoots(): string[] {
@@ -466,13 +535,14 @@ export class AsyncInspectorPanel {
                     <div class="toolbar">
                         <button id="resetBtn" class="btn">Reset</button>
                         <button id="genWhitelistBtn" class="btn">Gen Whitelist</button>
-                        <button id="snapshotBtn" class="btn">Snapshot</button>
-                        <button id="observerBtn" class="btn view-btn active">Execution Graph</button>
+                        <button id="snapshotBtn" class="btn view-btn">Snapshot</button>
+                        <button id="observerBtn" class="btn view-btn active">Observer</button>
+                        <button id="clearHistoryBtn" class="btn">Clear History</button>
                     </div>
                     <div class="main-content">
                         <div class="tree-panel">
                             <div class="execution-graph-header">
-                                <h3 id="treeViewTitle">Execution Graph</h3>
+                                <h3 id="treeViewTitle">Async Inspector — Observer</h3>
                             </div>
                             <div id="treeContainer"></div>
                         </div>
@@ -489,7 +559,10 @@ export class AsyncInspectorPanel {
                     </div>
                 </div>
                 <script>
-                    window.treeData = ${JSON.stringify(this._observerTreeRoots)};
+                    window.treeMode = ${JSON.stringify(this._currentTreeMode)};
+                    window.treeViewRequestId = ${JSON.stringify(this._treeViewRequestId)};
+                    window.treeData = ${JSON.stringify(this._currentTreeMode === 'observer' ? this._observerTreeRoots : this._snapshotTreeRoots)};
+                    window.observerRoot = ${JSON.stringify(this._observerRoot)};
                 </script>
                 <script src="${scriptUri}"></script>
             </body>
@@ -533,6 +606,8 @@ function treeNodeFromSnapshot(node: SnapshotPathNodeV1, snapshotIndex: number): 
         poll: node.poll.sequence,
         state: node.poll.state,
         snapshotIndex,
+        source: node.source ? { ...node.source } : undefined,
+        active: node.active,
         relationFromParent: node.relation_from_parent
             ? { ...node.relation_from_parent, evidence: [...node.relation_from_parent.evidence] }
             : undefined,
