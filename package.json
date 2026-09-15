@@ -47,6 +47,63 @@
                 "type": "string",
                 "description": "Connect to an already-running GDB server, e.g. localhost:1234"
               },
+              "enableOsDebug": {
+                "type": "boolean",
+                "description": "Enable OSStateMachine for an external remote launch",
+                "default": false
+              },
+              "program_counter_id": {
+                "type": "number",
+                "description": "Register ID of the program counter (32 for RISC-V)",
+                "default": 32
+              },
+              "first_breakpoint_group": {
+                "type": "string",
+                "description": "Name of the initial breakpoint group (typically \"kernel\")",
+                "default": "kernel"
+              },
+              "second_breakpoint_group": {
+                "type": "string",
+                "description": "Fallback breakpoint group name if the next group cannot be determined automatically"
+              },
+              "kernel_memory_ranges": {
+                "type": "array",
+                "description": "Kernel address ranges as [start, end) hex string pairs",
+                "default": [
+                  [
+                    "0xefffffffffffffff",
+                    "0xffffffffffffffff"
+                  ]
+                ]
+              },
+              "user_memory_ranges": {
+                "type": "array",
+                "description": "User address ranges as [start, end) hex string pairs",
+                "default": [
+                  [
+                    "0x0000000000000000",
+                    "0xe000000000000000"
+                  ]
+                ]
+              },
+              "border_breakpoints": {
+                "type": "array",
+                "description": "Border breakpoints that mark kernel↔user transitions",
+                "default": []
+              },
+              "hook_breakpoints": {
+                "type": "array",
+                "description": "Hook breakpoints with JS behavior for fetching the next process name",
+                "default": []
+              },
+              "filePathToBreakpointGroupNames": {
+                "type": "object",
+                "description": "JS function (as object with functionArguments/functionBody) mapping a file path to breakpoint group names"
+              },
+              "breakpointGroupNameToDebugFilePaths": {
+                "type": "object",
+                "description": "JS function (as object with functionArguments/functionBody) mapping a breakpoint group name to debug symbol file paths"
+              },
               "gdbPath": {
                 "type": "string",
                 "description": "Path to the GDB executable used for external remote launch; defaults to gdb"

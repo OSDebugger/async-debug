@@ -114,7 +114,7 @@ export interface InferredTraceRoot {
 // Attach request arguments
 // ---------------------------------------------------------------------------
 
-export interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments {
+export interface AttachRequestArguments extends DebugProtocol.AttachRequestArguments, OSDebugConfiguration {
     cwd: string;
     target: string;           // GDB remote target, e.g. ":1234"
     gdbpath?: string;
@@ -125,6 +125,9 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     stopAtConnect?: boolean;
     qemuPath: string;
     qemuArgs: string[];
+}
+
+export interface OSDebugConfiguration {
     program_counter_id?: number;
     first_breakpoint_group?: string;
     second_breakpoint_group?: string;
@@ -136,12 +139,13 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
 }
 
-export interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
+export interface LaunchRequestArguments extends DebugProtocol.LaunchRequestArguments, OSDebugConfiguration {
     program: string;
     args?: string[];
     cwd?: string;
     remote?: string;
     gdbPath?: string;
+    enableOsDebug?: boolean;
 }
 
 type DebugTransport = 'local' | 'remote';
@@ -333,6 +337,11 @@ export class GDBDebugSession extends DebugSession {
             return;
         }
 
+        if (config.enableOsDebug === true && !remote) {
+            this.sendErrorResponse(response, 2, '`enableOsDebug` requires an external `remote` endpoint');
+            return;
+        }
+
         if (!fs.existsSync(this.tempDir)) {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
@@ -343,10 +352,14 @@ export class GDBDebugSession extends DebugSession {
         this.osDebugReady = false;
         this.transport = remote ? 'remote' : 'local';
 
+        if (config.enableOsDebug === true) {
+            this.initOSDebug(config);
+        }
+
         if (remote) {
             this.launchGDB({
                 transport: 'remote',
-                enableOsDebug: false,
+                enableOsDebug: config.enableOsDebug === true,
                 gdbPath: config.gdbPath?.trim() || undefined,
                 executable: this.program,
                 target: remote,
@@ -380,6 +393,43 @@ export class GDBDebugSession extends DebugSession {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
 
+        this.initOSDebug(config);
+
+        // Launch QEMU in the integrated terminal, then start GDB after a short delay
+        // to give QEMU time to open the GDB stub on :1234.
+        const qemuCmd = [config.qemuPath, ...config.qemuArgs];
+        this.runInTerminalRequest(
+            { kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd },
+            15000,
+            (termResponse) => {
+                if (termResponse.success === false) {
+                    console.error('[ardb] Failed to launch QEMU in terminal');
+                    this.sendEvent(new TerminatedEvent());
+                    return;
+                }
+                // Give QEMU ~1s to open the GDB stub before GDB tries to connect
+                setTimeout(() => {
+                    this.launchGDB({
+                        transport: 'remote',
+                        enableOsDebug: true,
+                        gdbPath: config.gdbpath,
+                        debuggerArgs: config.debugger_args,
+                        executable: config.executable || '',
+                        target: config.target,
+                        autorun: config.autorun,
+                    });
+                }, 1000);
+            }
+        );
+
+        this.inferiorStarted = false;
+        this.gdbReady = false;
+        this.transport = 'remote';
+        this.sendResponse(response);
+    }
+
+    /** Shared OS-debug setup; transport startup stays in launch/attach. */
+    private initOSDebug(config: OSDebugConfiguration): void {
         // Initialize OS debug state from launch.json config
         this.programCounterId = config.program_counter_id ?? 32;
         this.kernelMemoryRanges = config.kernel_memory_ranges ?? [];
@@ -498,38 +548,6 @@ export class GDBDebugSession extends DebugSession {
                 this.breakpointGroups.updateHookBreakpoint(normalized);
             }
         }
-
-        // Launch QEMU in the integrated terminal, then start GDB after a short delay
-        // to give QEMU time to open the GDB stub on :1234.
-        const qemuCmd = [config.qemuPath, ...config.qemuArgs];
-        this.runInTerminalRequest(
-            { kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd },
-            15000,
-            (termResponse) => {
-                if (termResponse.success === false) {
-                    console.error('[ardb] Failed to launch QEMU in terminal');
-                    this.sendEvent(new TerminatedEvent());
-                    return;
-                }
-                // Give QEMU ~1s to open the GDB stub before GDB tries to connect
-                setTimeout(() => {
-                    this.launchGDB({
-                        transport: 'remote',
-                        enableOsDebug: true,
-                        gdbPath: config.gdbpath,
-                        debuggerArgs: config.debugger_args,
-                        executable: config.executable || '',
-                        target: config.target,
-                        autorun: config.autorun,
-                    });
-                }, 1000);
-            }
-        );
-
-        this.inferiorStarted = false;
-        this.gdbReady = false;
-        this.transport = 'remote';
-        this.sendResponse(response);
     }
 
     // -----------------------------------------------------------------------
