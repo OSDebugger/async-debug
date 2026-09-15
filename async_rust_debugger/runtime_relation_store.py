@@ -66,6 +66,15 @@ class ValidatedRelationStore:
             return None
 
         key = (parent_cid, child_cid, "await")
+        # Keep the actual successful observation for read-only current checks.
+        # This is not an instance epoch: poll counters only delimit executions.
+        parent_poll = parent_node.get("poll")
+        current_evidence = {
+            "child_hit": deepcopy(child_hit),
+            "parent_poll_sequence": _positive_int(
+                parent_poll.get("sequence") if isinstance(parent_poll, dict) else None
+            ),
+        }
         existing = self._relations.get(key)
         if existing is not None:
             # Same event is deliberately counted again: each successful Builder
@@ -75,6 +84,7 @@ class ValidatedRelationStore:
             existing["last_event_id"] = event_id
             existing["occurrence_count"] += 1
             existing["evidence"] = deepcopy(list(validation.get("evidence") or ()))
+            existing["current_evidence"] = current_evidence
             self._relations.move_to_end(key)
             return deepcopy(existing)
 
@@ -89,6 +99,7 @@ class ValidatedRelationStore:
             "first_event_id": event_id,
             "last_event_id": event_id,
             "occurrence_count": 1,
+            "current_evidence": current_evidence,
         }
         self._next_relation_id += 1
         self._relations[key] = record

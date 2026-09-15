@@ -1102,10 +1102,24 @@ def _find_nearby_coro(poll_sym: str, this_ptr: int, max_offset: int = 128) -> in
             return cid
     return None
 
-def _push_coro(cid: int) -> int:
-    tid = _thread_id()
+class _PollActivation(int):
+    """CID-compatible TLS entry carrying one observed invocation identity."""
+
+    def __new__(cls, cid, token):
+        entry = super().__new__(cls, cid)
+        entry.token = token
+        return entry
+
+    def __reduce__(self):
+        return type(self), (int(self), self.token)
+
+
+def _push_coro(cid: int, tid: int, sequence: int) -> int:
+    # Store reset already advances the observation domain on reset/disable.
+    epoch = _RUNTIME_RELATION_STORE.get_metadata()["store_generation"]
+    token = (epoch, tid, int(cid), sequence)
     st = _TLS_STACK.setdefault(tid, [])
-    st.append(cid)
+    st.append(_PollActivation(cid, token))
     return len(st) - 1  # depth
 
 def _current_coro():
@@ -1113,18 +1127,13 @@ def _current_coro():
     st = _TLS_STACK.get(tid, [])
     return (st[-1], len(st) - 1) if st else (0, -1)
 
-def _remove_coro_from_tls(tid: int, cid: int | None):
-    """Remove one matching active CID from a thread's coroutine stack."""
+def _retire_poll_activation(tid: int, token):
+    """Retire only the bound invocation, never an arbitrary matching CID."""
+    if token is None or token[1] != tid:
+        return
     st = _TLS_STACK.get(tid, [])
-    if not st:
-        return
-
-    if st[-1] == cid:
-        st.pop()
-        return
-
-    for i in range(len(st) - 1, -1, -1):
-        if st[i] == cid:
+    for i, entry in enumerate(st):
+        if getattr(entry, "token", None) == token:
             del st[i]
             return
 
@@ -1153,6 +1162,7 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         func: str = "",
         graph_entered: bool = False,
         cleanup_tls: bool = True,
+        activation_token=None,
     ):
         frame = gdb.selected_frame()
         previous_language = None
@@ -1171,19 +1181,41 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         self.func = func
         self.graph_entered = graph_entered
         self.cleanup_tls = cleanup_tls
+        self.activation_token = activation_token
+        self._retired = False
         _RUN_SCOPED_BPS.append(self)
 
     def stop(self):
+        if not self.cleanup_tls:
+            # Preserve the generic observer's original return semantics.
+            if self.graph_entered:
+                _record_call_exit(self.func, self.cid, thread_id=self.tid)
+            return False
+        if self._retired:
+            return False
+        if self.cleanup_tls and self.activation_token is not None:
+            if self.activation_token[0] != _RUNTIME_RELATION_STORE.get_metadata()["store_generation"]:
+                self._retire()
+                return False
         if self.graph_entered:
             _record_call_exit(self.func, self.cid, thread_id=self.tid)
 
         # Generic synchronous RuntimeEvents share graph exit handling but never
         # participate in main's coroutine TLS stack.
-        if not self.cleanup_tls:
-            return False
-
-        _remove_coro_from_tls(self.tid, self.cid)
+        self._retire()
         return False
+
+    def _retire(self):
+        if self._retired:
+            return
+        self._retired = True
+        if self.cleanup_tls:
+            _retire_poll_activation(self.tid, self.activation_token)
+
+    def out_of_scope(self):
+        # Observer retirement is not a normal return or a historical event.
+        if self.cleanup_tls:
+            self._retire()
 
 
 # -------------------------
@@ -1901,6 +1933,7 @@ class PollEntryBP(gdb.Breakpoint):
         is_new = False
         depth = -1
         parent_cid = None
+        activation_token = None
 
         existing_stack = _TLS_STACK.get(tid, [])
         if existing_stack:
@@ -1908,15 +1941,16 @@ class PollEntryBP(gdb.Breakpoint):
 
         if poll_sym and this_ptr is not None:
             cid, is_new = _get_or_make_coro_id(poll_sym, this_ptr)
-            depth = _push_coro(cid)
-
-        indent = "  " * max(depth, 0)
 
         # poll sequence per coro instance
         seq = 0
         if cid:
             seq = _CO_POLL_SEQ.get(cid, 0) + 1
             _CO_POLL_SEQ[cid] = seq
+            depth = _push_coro(cid, tid, seq)
+            activation_token = _TLS_STACK[tid][-1].token
+
+        indent = "  " * max(depth, 0)
 
         if parent_cid is not None and cid:
             child_hit = _record_runtime_child_hit(tid, parent_cid, cid, seq)
@@ -1991,6 +2025,7 @@ class PollEntryBP(gdb.Breakpoint):
                     cid,
                     graph_frame.get("func") if graph_frame else poll_sym,
                     graph_entered=graph_frame is not None,
+                    activation_token=activation_token,
                 )
             except Exception:
                 if graph_frame is not None:
@@ -2001,7 +2036,7 @@ class PollEntryBP(gdb.Breakpoint):
                         return_breakpoint_failed=True,
                     )
                 if cid:
-                    _remove_coro_from_tls(tid, cid)
+                    _retire_poll_activation(tid, activation_token)
                 raise
 
         # new coro line
@@ -3132,6 +3167,7 @@ def _snapshot_v1_data():
     async_path = project_snapshot_relations(
         async_path,
         _get_validated_runtime_relations(),
+        thread_id=tid,
     )
     return {
         "session_id": _ASYNC_SESSION_ID,
@@ -3302,6 +3338,7 @@ class ARDTraceDisableCommand(gdb.Command):
         ACTIVE_TRACE_ROOT = None
         _invalidate_whitelist_addrs()
         _clear_runtime_child_hits()
+        _TLS_STACK.clear()
         _RUNTIME_RELATION_STORE.reset()
         _reset_history_relation_baseline()
         _TRACE_ENABLED = False
