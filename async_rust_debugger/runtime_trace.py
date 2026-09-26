@@ -1766,6 +1766,18 @@ def _load_async_symbol_set_from_grouped():
         pass
 
 
+_POINTER_WRAPPER_FIELD_NAMES = ('__pointer', 'pointer', 'data', 'inner', 'value')
+
+
+def _iter_known_pointer_wrapper_fields(val: gdb.Value):
+    """Yield readable fields used by common Rust pointer wrappers."""
+    for field_name in _POINTER_WRAPPER_FIELD_NAMES:
+        try:
+            yield field_name, val[field_name]
+        except Exception:
+            continue
+
+
 def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
     """
     Recursively unwrap a GDB value to extract the raw memory address.
@@ -1794,14 +1806,10 @@ def _extract_raw_ptr(val: gdb.Value, depth: int = 0) -> int:
         # Struct — drill into known wrapper fields
         if code == gdb.TYPE_CODE_STRUCT:
             # Try well-known inner-pointer field names in priority order
-            for field_name in ('__pointer', 'pointer', 'data', 'inner', 'value'):
-                try:
-                    inner = val[field_name]
-                    result = _extract_raw_ptr(inner, depth + 1)
-                    if result > 0xffff:  # looks like a valid pointer
-                        return result
-                except Exception:
-                    pass
+            for _field_name, inner in _iter_known_pointer_wrapper_fields(val):
+                result = _extract_raw_ptr(inner, depth + 1)
+                if result > 0xffff:  # looks like a valid pointer
+                    return result
 
             # Generic single-field struct (common in Rust newtypes)
             try:
@@ -2873,17 +2881,31 @@ def _future_state_metadata(poll_sym: str, this_ptr: int):
         result["error"] = "missing future pointer"
         return result
 
-    env_type_name = _pollsym_to_envtype(poll_sym)
-    if not env_type_name:
+    future_type_name = _pollsym_to_envtype(poll_sym)
+    if not future_type_name:
+        # A manual Future impl may only have an opaque `{impl#N}::poll`
+        # symbol.  Reuse the existing DWARF `self: Pin<&mut T>` path instead
+        # of deriving an owner type from that symbol.  The address check binds
+        # the recovered type to this exact Snapshot object.
+        future_type_name = _runtime_child_type(
+            poll_sym,
+            expected_address=this_ptr,
+        )
+    if not future_type_name:
         result["error"] = "unsupported poll symbol"
         return result
 
     try:
-        env_type = gdb.lookup_type(env_type_name)
+        env_type = gdb.lookup_type(future_type_name)
         concrete_type = env_type.strip_typedefs()
         result["future_type"] = str(concrete_type)
         result["future_type_source"] = "dwarf"
     except Exception as exc:
+        _log_future_type_recovery_failure(
+            "concrete DWARF type lookup failed",
+            poll_sym,
+            f"type={future_type_name!r} error={exc}",
+        )
         result["status"] = _state_read_failure_status(str(exc))
         result["error"] = str(exc) or "future type lookup failed"
         return result
@@ -2904,8 +2926,18 @@ def _future_state_metadata(poll_sym: str, this_ptr: int):
     return result
 
 
-def _runtime_child_type(poll_sym: str):
-    """Read a compiler Future type for evidence without Snapshot state."""
+def _log_future_type_recovery_failure(reason: str, poll_sym: str, detail: str = ""):
+    message = (
+        f"[ARD] Future type recovery failed: {reason}; "
+        f"poll={poll_sym!r}"
+    )
+    if detail:
+        message += f"; {detail}"
+    _log_ard(message)
+
+
+def _runtime_child_type(poll_sym: str, expected_address: int | None = None):
+    """Read a DWARF Future type for evidence without Snapshot state."""
     env_type_name = _pollsym_to_envtype(poll_sym)
     if env_type_name:
         try:
@@ -2920,8 +2952,12 @@ def _runtime_child_type(poll_sym: str):
     if trait_poll:
         try:
             return str(gdb.lookup_type(trait_poll.group(1)).strip_typedefs())
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_future_type_recovery_failure(
+                "concrete DWARF type lookup failed",
+                poll_sym,
+                f"type={trait_poll.group(1)!r} error={exc}",
+            )
 
     # Rust may expose an impl method only as `crate::{impl#N}::poll`, which
     # carries no recoverable owner type in the symbol.  At the real poll entry,
@@ -2929,17 +2965,43 @@ def _runtime_child_type(poll_sym: str):
     # the symbol.  This is deliberately fail-closed and minimal-testcase safe.
     try:
         frame = gdb.selected_frame()
+    except Exception as exc:
+        _log_future_type_recovery_failure(
+            "no matching poll frame",
+            poll_sym,
+            f"selected_frame unavailable: {exc}",
+        )
+        return ""
+
+    try:
         frame_name = _normalize_sym_name(frame.name() or "")
         if frame_name != _normalize_sym_name(str(poll_sym or "")):
+            _log_future_type_recovery_failure(
+                "no matching poll frame",
+                poll_sym,
+                f"selected={frame_name!r}",
+            )
             return ""
 
-        self_value = frame.read_var("self")
+        try:
+            self_value = frame.read_var("self")
+        except Exception as exc:
+            _log_future_type_recovery_failure(
+                "self unavailable / optimized out",
+                poll_sym,
+                str(exc),
+            )
+            return ""
+
         self_type = self_value.type.strip_typedefs()
         if not str(self_type).startswith("core::pin::Pin<"):
+            _log_future_type_recovery_failure(
+                "unsupported self type",
+                poll_sym,
+                f"type={self_type}",
+            )
             return ""
 
-        pointer_value = self_value["__pointer"]
-        pointer_type = pointer_value.type.strip_typedefs()
         reference_codes = {
             code
             for code in (
@@ -2949,14 +3011,57 @@ def _runtime_child_type(poll_sym: str):
             )
             if code is not None
         }
-        if pointer_type.code not in reference_codes:
+        pointer_value = None
+        pointer_type = None
+        pointer_field = None
+        for field_name, candidate in _iter_known_pointer_wrapper_fields(self_value):
+            candidate_type = candidate.type.strip_typedefs()
+            if candidate_type.code in reference_codes:
+                pointer_value = candidate
+                pointer_type = candidate_type
+                pointer_field = field_name
+                break
+
+        if pointer_value is None or pointer_type is None:
+            _log_future_type_recovery_failure(
+                "Pin pointer unwrap failed",
+                poll_sym,
+                f"self_type={self_type}",
+            )
             return ""
+
+        if expected_address is not None:
+            self_address = _normalize_addr(_extract_raw_ptr(pointer_value))
+            snapshot_address = _normalize_addr(expected_address)
+            if (
+                self_address is None
+                or snapshot_address is None
+                or self_address != snapshot_address
+            ):
+                _log_future_type_recovery_failure(
+                    "self address mismatch",
+                    poll_sym,
+                    f"field={pointer_field!r} self={self_address!r} "
+                    f"expected={snapshot_address!r}",
+                )
+                return ""
 
         target_type = pointer_type.target().strip_typedefs()
         target_name = str(target_type).strip()
-        return target_name if target_name else ""
-    except Exception:
-        pass
+        if not target_name:
+            _log_future_type_recovery_failure(
+                "Pin pointer unwrap failed",
+                poll_sym,
+                f"field={pointer_field!r} has empty target type",
+            )
+            return ""
+        return target_name
+    except Exception as exc:
+        _log_future_type_recovery_failure(
+            "Pin pointer unwrap failed",
+            poll_sym,
+            str(exc),
+        )
     return ""
 
 

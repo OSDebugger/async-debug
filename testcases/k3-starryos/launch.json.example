@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "K3 COM260 StarryOS (ARD/OpenOCD)",
+      "type": "ardb",
+      "request": "launch",
+      "program": "${env:K3_STARRYOS_ELF}",
+      "cwd": "${workspaceFolder}",
+      "remote": "localhost:3333",
+      "gdbPath": "gdb-multiarch",
+      "enableOsDebug": false,
+      "stopOnEntry": false
+    }
+  ]
+}
