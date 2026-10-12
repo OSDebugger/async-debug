@@ -1,6 +1,7 @@
 import os
 import re
 import struct
+import time
 import gdb
 import json
 
@@ -15,6 +16,123 @@ PRINT_INTERNAL_POLL_HITS = True
 
 # True => 第一次进入用户可见 poll 时，打印 whitelist 地址解析统计
 PRINT_WHITELIST_ADDR_STATS = True
+
+# -------------------------
+# Profiling (performance measurement, off by default)
+# -------------------------
+# ARDB_PROFILE=1  => measure wall-clock time spent inside each breakpoint's
+#                    Python stop() callback while the inferior is stopped.
+#                    A report is printed on inferior exit and on the
+#                    `ardb-profile-report` command, then counters reset.
+# ARDB_PROFILE_DETAIL=1 (implies ARDB_PROFILE) => additionally time named
+#                    sections inside poll_entry / call_site callbacks.
+
+PROFILE_ENABLED = os.environ.get("ARDB_PROFILE") == "1"
+PROFILE_DETAIL = PROFILE_ENABLED and os.environ.get("ARDB_PROFILE_DETAIL") == "1"
+
+# bucket upper bounds in microseconds
+_PROFILE_BUCKETS = (100, 1000, 10000, float("inf"))
+_PROFILE_BUCKET_LABELS = ("<0.1ms", "0.1-1ms", "1-10ms", ">10ms")
+_PROFILE_KINDS = ("poll_entry", "call_site", "pop_on_return")
+
+_PROFILE_STATS = {
+    k: {"count": 0, "total_us": 0.0, "max_us": 0.0, "buckets": [0, 0, 0, 0]}
+    for k in _PROFILE_KINDS
+}
+# kind -> {section_name: [calls, total_us, max_us]}
+_PROFILE_DETAILS = {}
+
+def _profile_now():
+    return time.perf_counter()
+
+def _profiled(kind: str):
+    """Decorator: time the whole stop() callback of a breakpoint class."""
+    def deco(fn):
+        def wrapper(self):
+            t0 = _profile_now() if PROFILE_ENABLED else None
+            try:
+                return fn(self)
+            finally:
+                _profile_tick(kind, t0)
+        return wrapper
+    return deco
+
+def _profile_tick(kind: str, t0):
+    if not PROFILE_ENABLED or t0 is None:
+        return
+    us = (_profile_now() - t0) * 1e6
+    st = _PROFILE_STATS[kind]
+    st["count"] += 1
+    st["total_us"] += us
+    st["max_us"] = max(st["max_us"], us)
+    for i, hi in enumerate(_PROFILE_BUCKETS):
+        if us < hi:
+            st["buckets"][i] += 1
+            break
+
+def _profile_section(kind: str, name: str, t0):
+    """Record a named sub-section of a stop() callback (detail mode only)."""
+    if not PROFILE_DETAIL or t0 is None:
+        return
+    us = (_profile_now() - t0) * 1e6
+    d = _PROFILE_DETAILS.setdefault(kind, {}).setdefault(name, [0, 0.0, 0.0])
+    d[0] += 1
+    d[1] += us
+    d[2] = max(d[2], us)
+
+def _profile_report():
+    global _PROFILE_STATS, _PROFILE_DETAILS
+    if not PROFILE_ENABLED:
+        gdb.write("[ARD-PROFILE] profiling is off (set ARDB_PROFILE=1).\n")
+        return
+    lines = ["[ARD-PROFILE] === stop() cost report ==="]
+    total_hits = 0
+    total_us = 0.0
+    for kind in _PROFILE_KINDS:
+        st = _PROFILE_STATS[kind]
+        if st["count"] == 0:
+            lines.append(f"[ARD-PROFILE] {kind}: no hits")
+            continue
+        avg = st["total_us"] / st["count"]
+        total_hits += st["count"]
+        total_us += st["total_us"]
+        dist = " ".join(
+            f"{_PROFILE_BUCKET_LABELS[i]}={st['buckets'][i]}"
+            for i in range(len(_PROFILE_BUCKETS))
+        )
+        lines.append(
+            f"[ARD-PROFILE] {kind}: {st['count']} hits, "
+            f"avg={avg:.1f}us, max={st['max_us']:.1f}us, total={st['total_us'] / 1e6:.3f}s"
+        )
+        lines.append(f"[ARD-PROFILE]   dist: {dist}")
+        details = _PROFILE_DETAILS.get(kind)
+        if details:
+            for name, (c, tot, mx) in sorted(details.items(), key=lambda kv: -kv[1][1]):
+                lines.append(
+                    f"[ARD-PROFILE]   | {name}: {c} calls, "
+                    f"avg={tot / c:.1f}us, total={tot / 1e6:.3f}s"
+                )
+    if total_hits:
+        lines.append(
+            f"[ARD-PROFILE] ALL: {total_hits} stops, "
+            f"total python stop() time={total_us / 1e6:.3f}s"
+        )
+    msg = "\n".join(lines)
+    gdb.write(msg + "\n")
+    path = _default_log_path()
+    if path:
+        try:
+            profile_path = os.path.join(os.path.dirname(path), "ardb_profile.log")
+            with open(profile_path, "a", encoding="utf-8") as fp:
+                fp.write(msg + "\n")
+        except Exception:
+            pass
+    # reset so the next run / manual report starts clean
+    _PROFILE_STATS = {
+        k: {"count": 0, "total_us": 0.0, "max_us": 0.0, "buckets": [0, 0, 0, 0]}
+        for k in _PROFILE_KINDS
+    }
+    _PROFILE_DETAILS = {}
 
 
 # Regex to parse GDB's "info line" output:
@@ -127,6 +245,7 @@ class _PopOnReturnBP(gdb.FinishBreakpoint):
         self.cid = cid
         _RUN_SCOPED_BPS.append(self)
 
+    @_profiled("pop_on_return")
     def stop(self):
         st = _TLS_STACK.get(self.tid, [])
         if not st:
@@ -812,6 +931,7 @@ def _cleanup_run_scoped():
 
 def _on_exited(event):
     _DIAG_LOG("[DIAG] _on_exited() fired")
+    _profile_report()
     _cleanup_run_scoped()
 
 def _on_new_objfile(event):
@@ -841,7 +961,9 @@ class PollEntryBP(gdb.Breakpoint):
         if isinstance(location, str) and location.strip().startswith("*"):
             _RUN_SCOPED_BPS.append(self)
 
+    @_profiled("poll_entry")
     def stop(self) -> bool:
+        t_s = _profile_now()
         fn = _current_function_name()
 
         # ---- coro context enter (best-effort) ----
@@ -880,6 +1002,9 @@ class PollEntryBP(gdb.Breakpoint):
             seq = _CO_POLL_SEQ.get(cid, 0) + 1
             _CO_POLL_SEQ[cid] = seq
 
+        _profile_section("poll_entry", "coro_setup", t_s)
+        t_s = _profile_now()
+
         _build_whitelist_addr_map_if_needed(caller_is_user_visible=(not self.internal))
 
         # new coro line
@@ -889,6 +1014,9 @@ class PollEntryBP(gdb.Breakpoint):
         # poll line
         if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
             _log_ard(f"[ARD]{indent} poll[coro#{cid} poll#{seq}] {fn}") # 使用默认的 False
+
+        _profile_section("poll_entry", "log_poll", t_s)
+        t_s = _profile_now()
 
         # awaitee line (no output dedup)
         if self.poll_sym:
@@ -905,6 +1033,9 @@ class PollEntryBP(gdb.Breakpoint):
                         _ACTIVE_ROOTS.add(child_poll)
                         PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
 
+        _profile_section("poll_entry", "awaitee", t_s)
+        t_s = _profile_now()
+
         # Install call-site breakpoints once per function (per run)
         if fn not in _CALLSITE_INSTALLED_FOR_FN:
             try:
@@ -912,6 +1043,7 @@ class PollEntryBP(gdb.Breakpoint):
             except gdb.error as e:
                 if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
                     _log_ard(f"[ARD]{indent} call-site scan failed: {e}")
+                _profile_section("poll_entry", "callsite_install", t_s)
                 return False
 
             for a in call_sites:
@@ -924,6 +1056,7 @@ class PollEntryBP(gdb.Breakpoint):
         else:
             _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): SKIPPED call-site scan for '{fn}' - already in _CALLSITE_INSTALLED_FOR_FN")
 
+        _profile_section("poll_entry", "callsite_install", t_s)
         return False
 
 
@@ -935,12 +1068,17 @@ class CallSiteBP(gdb.Breakpoint):
         _CREATED_BPS.append(self)
         _RUN_SCOPED_BPS.append(self)
 
+    @_profiled("call_site")
     def stop(self) -> bool:
+        t_s = _profile_now()
         target = _resolve_call_target_from_asm(_current_asm())
+        _profile_section("call_site", "asm+resolve", t_s)
         if not target:
             return False
 
+        t_s = _profile_now()
         callee = _pick_interesting_callee(target)
+        _profile_section("call_site", "callee_lookup", t_s)
         if not callee:
             return False
 
@@ -949,8 +1087,12 @@ class CallSiteBP(gdb.Breakpoint):
         indent = "  " * max(depth, 0)
         seq = _CO_POLL_SEQ.get(cid, 0) if cid else 0
 
+        t_s = _profile_now()
+
         # call line (no output dedup)
         _log_ard(f"[ARD]{indent} call[coro#{cid} poll#{seq}] {caller} -> {callee}") # 使用默认的 False
+
+        _profile_section("call_site", "log_call", t_s)
 
         if _is_pollish_name(callee) and callee not in _ACTIVE_ROOTS:
             _ACTIVE_ROOTS.add(callee)
@@ -1081,6 +1223,19 @@ class ARDResetCommand(gdb.Command):
                 pass
 
         gdb.write("[ARD] reset done.\n")
+
+
+class ARDProfileReportCommand(gdb.Command):
+    """Print accumulated stop() timing statistics and reset them.
+    Useful in OS mode where the inferior never exits.
+    Usage: ardb-profile-report"""
+
+    def __init__(self):
+        super().__init__("ardb-profile-report", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        _profile_report()
+
 
 class ARDLoadWhitelistCommand(gdb.Command):
     def __init__(self):
@@ -1754,6 +1909,7 @@ def install():
 
     ARDTraceCommand()
     ARDResetCommand()
+    ARDProfileReportCommand()
     ARDLoadWhitelistCommand()
     ARDGenWhitelistCommand()
     ARDGetSnapshotCommand()
