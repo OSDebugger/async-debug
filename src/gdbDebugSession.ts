@@ -38,6 +38,7 @@ import {
     stateTransition,
 } from './OSStateMachine';
 import { isKernelAddr, isUserAddr, parseAddr } from './addrSpace';
+import { OsProfiler, SingleStepCtx } from './osProfiler';
 
 // ---------------------------------------------------------------------------
 // Exported interfaces (used by asyncInspectorPanel and extension)
@@ -106,6 +107,8 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     }>;
     filePathToBreakpointGroupNames?: { functionArguments: string; functionBody: string; isAsync: boolean };
     breakpointGroupNameToDebugFilePaths?: { functionArguments: string; functionBody: string; isAsync: boolean };
+    profileTs?: boolean;       // experiment B: enable TS-side OS profiling
+    profileTsLog?: string;     // experiment B: also append [ARD-PROFILE-TS] lines to this file
 }
 
 // ---------------------------------------------------------------------------
@@ -169,6 +172,8 @@ export class GDBDebugSession extends DebugSession {
     private osDebugReady = false;
     private osState: OSState = new OSState(OSStateMachine.initial);
     private breakpointGroups: BreakpointGroups | undefined;
+    public osProfiler: OsProfiler | null = null;   // experiment B: null when disabled
+    private singleStepProfileCtx: SingleStepCtx | null = null;   // active consecutive-single-step run
     private recentStopThreadId = 1;
     private kernelMemoryRanges: string[][] = [];
     private userMemoryRanges: string[][] = [];
@@ -327,6 +332,9 @@ export class GDBDebugSession extends DebugSession {
         };
 
         this.breakpointGroups = new BreakpointGroups(firstGroup, bpgSession, secondGroup);
+
+        // Experiment B: TS-side OS profiling, enabled per launch config.
+        this.osProfiler = new OsProfiler({ enabled: !!config.profileTs, logPath: config.profileTsLog });
 
         // Register initial borders from launch.json
         if (config.border_breakpoints) {
@@ -902,6 +910,9 @@ export class GDBDebugSession extends DebugSession {
         this.functionBreakpointNumbers = [];
         this.varRefMap.clear();
         this.createdVarObjects = [];
+
+        // Experiment B: print the cumulative OS profiling report.
+        this.osProfiler?.report();
 
         this.sendResponse(response);
     }
@@ -1497,6 +1508,29 @@ export class GDBDebugSession extends DebugSession {
         return false;
     }
 
+    // ---- experiment B: single-step profiling helpers -----------------------
+
+    private beginSingleStepProfile(): void {
+        if (!this.osProfiler) { return; }
+        if (this.singleStepProfileCtx) {
+            this.osProfiler.endSingleStep(this.singleStepProfileCtx);
+        }
+        const direction = this.osState.status === OSStates.kernel_single_step_to_user
+            ? 'kernel_to_user' : 'user_to_kernel';
+        this.singleStepProfileCtx = this.osProfiler.beginSingleStep(direction);
+    }
+
+    private countSingleStepProfile(): void {
+        this.osProfiler?.countStep(this.singleStepProfileCtx);
+    }
+
+    private endSingleStepProfile(): void {
+        if (this.osProfiler && this.singleStepProfileCtx) {
+            this.osProfiler.endSingleStep(this.singleStepProfileCtx);
+            this.singleStepProfileCtx = null;
+        }
+    }
+
     private doAction(action: Action): void {
         if (!this.miDebugger) return;
 
@@ -1505,14 +1539,17 @@ export class GDBDebugSession extends DebugSession {
             this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                 if (!regs || regs.length === 0 || !regs[0]) {
                     console.warn('[ardb] check_if_kernel_yet: no register data, retrying step');
+                    this.countSingleStepProfile();
                     this.miDebugger!.stepInstruction();
                     return;
                 }
                 const pc = parseAddr(regs[0].value ?? '');
                 if (pc !== undefined && isKernelAddr(pc, this.kernelMemoryRanges)) {
                     this.showInfo('arrived at kernel. current addr: ' + pc.toString(16));
+                    this.endSingleStepProfile();
                     this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL));
                 } else {
+                    this.countSingleStepProfile();
                     this.miDebugger!.stepInstruction();
                 }
             });
@@ -1529,12 +1566,15 @@ export class GDBDebugSession extends DebugSession {
                 console.log(`[ardb] check_if_user_yet: sepc=${sepcStr}, isUser=${isUser}`);
                 if (isUser) {
                     this.showInfo('sepc points to user space, switching group');
+                    this.endSingleStepProfile();
                     this.osStateTransition(new OSEvent(OSEvents.AT_USER));
                 } else {
                     // sepc not in user space yet — keep single-stepping
+                    this.countSingleStepProfile();
                     this.miDebugger!.stepInstruction();
                 }
             }).catch(() => {
+                this.countSingleStepProfile();
                 this.miDebugger!.stepInstruction();
             });
         }
@@ -1586,6 +1626,9 @@ export class GDBDebugSession extends DebugSession {
                             for (const border of borders) {
                                 if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'user_to_kernel')) {
                                     this.pendingBreakpointNode = undefined;
+                                    // PC was already in kernel (no single-step run happened);
+                                    // clear any stale single-step profile context just in case.
+                                    this.endSingleStepProfile();
                                     this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL));
                                     return;
                                 }
@@ -1619,6 +1662,8 @@ export class GDBDebugSession extends DebugSession {
         }
         else if (action.type === DebuggerActions.start_consecutive_single_steps) {
             this.showInfo('doing action: start_consecutive_single_steps');
+            this.beginSingleStepProfile();
+            this.countSingleStepProfile();
             this.miDebugger.stepInstruction();
         }
         else if (action.type === DebuggerActions.try_get_next_breakpoint_group_name) {

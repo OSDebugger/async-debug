@@ -4,6 +4,7 @@
 
 import { DebugProtocol } from "@vscode/debugprotocol";
 import { Breakpoint } from "./backend/backend";
+import { OsProfiler, SwitchCtx } from "./osProfiler";
 
 export type FunctionString = string;
 
@@ -34,6 +35,8 @@ export interface IBreakpointGroupsSession {
 	// Crates the user enabled via ardb-update-whitelist. Used to re-apply the
 	// user's selection after a group switch regenerates the whitelist.
 	getWhitelistEnabledCrates?(): string[];
+	// OS-mode profiling (experiment B), null when disabled.
+	osProfiler?: OsProfiler | null;
 }
 
 export class Border {
@@ -201,6 +204,9 @@ export class BreakpointGroups {
 		// 0. Save async trace state BEFORE clearing old breakpoints.
 		const oldGroupName = this.groups[oldIndex].name;
 		const newGroupName = this.groups[newIndex].name;
+		const profCtx: SwitchCtx | null = this.session.osProfiler
+			? this.session.osProfiler.beginSwitch(oldGroupName, newGroupName)
+			: null;
 
 		this.session.showInformationMessage(`[DIAG] updateCurrentBreakpointGroup: ${oldGroupName} → ${newGroupName}`);
 		this.session.showInformationMessage(`[DIAG] saving trace state for '${oldGroupName}'...`);
@@ -209,6 +215,7 @@ export class BreakpointGroups {
 			`ardb-save-trace-state ${oldGroupName}`
 		).catch(() => { /* best-effort */ }).then(() => {
 
+		this.session.osProfiler?.markStep(profCtx, 'save_state');
 		this.session.showInformationMessage(`[DIAG] save done, now switching symbols (clear→unload→load→reinsert)...`);
 
 		const newBpCount = this.groups[newIndex].setBreakpointsArguments.reduce((s, a) => s + (a.breakpoints?.length ?? 0), 0);
@@ -259,22 +266,29 @@ export class BreakpointGroups {
 		const filesToAdd = newSymbolFiles.filter(e => !this.loadedSymbolFiles.has(toPath(e)));
 
 		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises])
-			.then(() => Promise.all(filesToRemove.map(p =>
-				this.session.miDebugger.removeSymbolFile(p).then(() => {
-					this.loadedSymbolFiles.delete(p);
-				}).catch(err => {
-					console.error('[ardb] removeSymbolFile failed:', err);
-					this.loadedSymbolFiles.delete(p);  // remove from tracking even on failure
-				})
-			)))
-			.then(() => Promise.all(filesToAdd.map(f =>
-				this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).then((ok) => {
-					if (ok) this.loadedSymbolFiles.add(toPath(f));
-				}).catch(err => {
-					console.error('[ardb] addSymbolFile failed:', err);
-				})
-			)))
 			.then(() => {
+				this.session.osProfiler?.markStep(profCtx, 'clear_bps');
+				return Promise.all(filesToRemove.map(p =>
+					this.session.miDebugger.removeSymbolFile(p).then(() => {
+						this.loadedSymbolFiles.delete(p);
+					}).catch(err => {
+						console.error('[ardb] removeSymbolFile failed:', err);
+						this.loadedSymbolFiles.delete(p);  // remove from tracking even on failure
+					})
+				));
+			})
+			.then(() => {
+				this.session.osProfiler?.markStep(profCtx, 'unload_symbols');
+				return Promise.all(filesToAdd.map(f =>
+					this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).then((ok) => {
+						if (ok) this.loadedSymbolFiles.add(toPath(f));
+					}).catch(err => {
+						console.error('[ardb] addSymbolFile failed:', err);
+					})
+				));
+			})
+			.then(() => {
+				this.session.osProfiler?.markStep(profCtx, 'load_symbols');
 				// 3. Re-insert new group's breakpoints
 				const breakpointPromises = this.groups[newIndex].setBreakpointsArguments.map((args) => {
 					return this.session.miDebugger.clearBreakPoints(args.source.path).then(
@@ -311,6 +325,7 @@ export class BreakpointGroups {
 					.then(([bpResults]) => bpResults);
 			})
 			.then((nestedResults) => {
+				this.session.osProfiler?.markStep(profCtx, 'reinsert_bps');
 				// 4. Notify session to send BreakpointEvent('changed') for each restored BP
 				const flat = (nestedResults as Array<Array<[boolean, Breakpoint]>>).flat();
 				this.session.onBreakpointsRestored(flat);
@@ -321,6 +336,7 @@ export class BreakpointGroups {
 					`ardb-restore-trace-state ${newGroupName}`
 				).catch(() => { /* best-effort */ })
 				.then(() => {
+					this.session.osProfiler?.markStep(profCtx, 'restore_state');
 					// 5.5 Only when NEW symbol files were loaded (switching TO a user
 					//     group) does the whitelist need regeneration: `info functions`
 					//     now includes the user-space symbols that were missing when the
@@ -353,12 +369,15 @@ export class BreakpointGroups {
 				});
 			})
 			.then(() => {
+				this.session.osProfiler?.markStep(profCtx, 'whitelist_rebuild');
+				this.session.osProfiler?.endSwitch(profCtx);
 				// 6. Now safe to continue execution
 				if (continueAfterUpdate) {
 					this.session.miDebugger.continue();
 				}
 			})
 			.catch(err => {
+				this.session.osProfiler?.endSwitch(profCtx);
 				console.error('[ardb] updateCurrentBreakpointGroup failed:', err);
 				if (continueAfterUpdate) {
 					this.session.miDebugger.continue();
