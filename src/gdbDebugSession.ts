@@ -284,10 +284,17 @@ export class GDBDebugSession extends DebugSession {
         // and re-evaling the function string each time is unnecessary overhead.
         this.cachedFilePathToGroupNames = eval(filePathToGroupNames) as (filePath: string) => string[];
 
+        // Experiment B: TS-side OS profiling, enabled per launch config.
+        // Must be created BEFORE bpgSession so the session can see it.
+        this.osProfiler = new OsProfiler({ enabled: !!config.profileTs, logPath: config.profileTsLog });
+
         const self = this;
         const bpgSession: IBreakpointGroupsSession = {
             get miDebugger(): IDebuggerBackend {
                 return self.miDebugger as unknown as IDebuggerBackend;
+            },
+            get osProfiler(): OsProfiler | null {
+                return self.osProfiler;
             },
             filePathToBreakpointGroupNames: filePathToGroupNames,
             breakpointGroupNameToDebugFilePaths: groupNameToFilePaths,
@@ -332,9 +339,6 @@ export class GDBDebugSession extends DebugSession {
         };
 
         this.breakpointGroups = new BreakpointGroups(firstGroup, bpgSession, secondGroup);
-
-        // Experiment B: TS-side OS profiling, enabled per launch config.
-        this.osProfiler = new OsProfiler({ enabled: !!config.profileTs, logPath: config.profileTsLog });
 
         // Register initial borders from launch.json
         if (config.border_breakpoints) {
