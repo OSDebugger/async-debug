@@ -298,7 +298,12 @@ _SAVED_STATES: dict[str, dict] = {}
 # Low-level helpers
 # -------------------------
 
-CALL_MNEMONIC_RE = re.compile(r"^\s*call\w*\b", re.IGNORECASE)
+CALL_MNEMONIC_RE = re.compile(
+    # x86 call/callq/callplt；RISC-V call 伪指令由 "call" 覆盖、jal（直接）、
+    # jalr（间接，rd=zero 是 tail call 不记录）、压缩形式 c.jalr/c.j；
+    # AArch64 bl（直接）/blr（间接）
+    r"^\s*(?:call\w*|jalr\s+(?!zero\b)|jal\b|c\.jalr|c\.j|bl\b|blr\b)\b",
+    re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
 def _ptr_size() -> int:
@@ -415,6 +420,44 @@ def _function_range() -> tuple[int, int] | None:
         return None
     return (int(blk.start), int(blk.end))
 
+def _direct_call_target_from_asm(asm: str) -> int | None:
+    """仅对直接调用文本抠目标立即数；间接形式返回 None（安装时无法判定）。"""
+    s = asm.strip()
+    # 间接调用形式（寄存器/内存槽目标）不在此解析
+    if "*" in s or s.startswith("jalr") or s.startswith("c.jalr") or s.startswith("blr"):
+        return None
+    if "0x" not in s:
+        return None
+    m = HEX_ADDR_RE.search(s)
+    if m is None:
+        return None
+    return int(m.group(1), 16)
+
+def _should_install_callsite(target_addr: int) -> bool:
+    """安装时过滤：判定与命中时 _pick_interesting_callee 的三路径完全一致。
+    True = 直接调用目标值得插桩。"""
+    if _whitelist_enabled() and _WHITELIST_ADDR_READY:
+        if _whitelist_allows_by_addr(target_addr):
+            return True
+        for n in _callee_candidates(target_addr):
+            n2 = _normalize_sym_name(n)
+            if _whitelist_allows_by_name(n2):
+                return True
+        return False
+
+    if _whitelist_enabled():
+        for n in _callee_candidates(target_addr):
+            n2 = _normalize_sym_name(n)
+            if _whitelist_allows_by_name(n2):
+                return True
+        return False
+
+    # 无白名单：只看 poll-ish 名字
+    for n in _callee_candidates(target_addr):
+        if _is_pollish_name(n):
+            return True
+    return False
+
 def _collect_call_sites() -> list[int]:
     r = _function_range()
     if r is None:
@@ -427,11 +470,18 @@ def _collect_call_sites() -> list[int]:
     seen = set()
     for ins in insns:
         asm = ins.get("asm", "").strip()
-        if CALL_MNEMONIC_RE.match(asm):
-            a = int(ins["addr"])
-            if a not in seen:
-                out.append(a)
-                seen.add(a)
+        if not CALL_MNEMONIC_RE.match(asm):
+            continue
+        a = int(ins["addr"])
+        if a in seen:
+            continue
+        # 直接调用：安装时解析目标并按白名单/启发式过滤（与命中时判定一致）；
+        # 间接调用：目标在寄存器/内存槽，运行时才知道，全部照插。
+        target = _direct_call_target_from_asm(asm)
+        if target is not None and not _should_install_callsite(target):
+            continue
+        out.append(a)
+        seen.add(a)
 
     return out[:MAX_CALLSITES_PER_FN]
 
@@ -474,6 +524,25 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
         disp = int(disp_s, 16) if disp_s.startswith(("0x", "-0x")) else int(disp_s, 10)
         slot = _reg_u64(base) + disp
         return _read_ptr(slot)
+
+    # RISC-V: jal ra, 0xADDR —— 直接调用（jal 后面必须跟空白，排除 jalr）
+    if re.match(r"jal\s", s) and "0x" in s:
+        m = HEX_ADDR_RE.search(s)
+        if m:
+            return int(m.group(1), 16)
+        return None
+
+    # RISC-V: jalr rd, off(reg) —— 间接调用，命中时读寄存器
+    m = re.search(r"jalr\s+\w+\s*,\s*([\-0-9a-fx]+)\((\w+)\)", s)
+    if m:
+        off_s, reg = m.group(1), m.group(2)
+        off = int(off_s, 16) if off_s.startswith(("0x", "-0x")) else int(off_s, 10)
+        return _reg_u64(reg) + off
+
+    # RISC-V 压缩形式: c.jalr rs —— 间接调用，目标在 rs
+    m = re.search(r"c\.jalr\s+(\w+)", s)
+    if m:
+        return _reg_u64(m.group(1))
 
     return None
 
