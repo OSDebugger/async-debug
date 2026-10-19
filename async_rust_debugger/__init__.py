@@ -1,7 +1,6 @@
 # note: when importing always starts from the package root
 # example: import async_rust_debugger.module.submodule
 import gdb
-from async_rust_debugger.static_analysis.poll_functions import parse_info_functions
 
 import async_rust_debugger.runtime_trace as rt
 rt.install()
