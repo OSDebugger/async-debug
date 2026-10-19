@@ -35,6 +35,12 @@ export interface IBreakpointGroupsSession {
 	// Crates the user enabled via ardb-update-whitelist. Used to re-apply the
 	// user's selection after a group switch regenerates the whitelist.
 	getWhitelistEnabledCrates?(): string[];
+	// 白名单重建瘦身：组切换时据此决定是否跳过 gen→update→load→trace-user-crate 四连。
+	getWhitelistInitializedGroups?(): Set<string>;
+	markWhitelistGroupInitialized?(group: string): void;
+	isWhitelistDirty?(): boolean;
+	clearWhitelistDirty?(): void;
+	sendCliCommandAndGetOutput?(command: string): Promise<string>;
 	// OS-mode profiling (experiment B), null when disabled.
 	osProfiler?: OsProfiler | null;
 }
@@ -337,35 +343,45 @@ export class BreakpointGroups {
 				).catch(() => { /* best-effort */ })
 				.then(() => {
 					this.session.osProfiler?.markStep(profCtx, 'restore_state');
-					// 5.5 Only when NEW symbol files were loaded (switching TO a user
-					//     group) does the whitelist need regeneration: `info functions`
-					//     now includes the user-space symbols that were missing when the
-					//     whitelist was first generated. Switching back to the kernel
-					//     group loads no new files, so we skip this entirely.
+					// 5.5 白名单重建四连只在「首次进入该用户组」或「用户在 UI 改过
+					//     enabled crates（dirty）」时执行；后续切回依赖 restore-trace-state
+					//     已恢复的白名单与入口断点，整条链跳过。
 					if (filesToAdd.length === 0) {
 						return;
 					}
-					this.session.showInformationMessage(`[DIAG] regenerating whitelist (user symbols loaded)...`);
-					return this.session.miDebugger.sendCliCommand('ardb-gen-whitelist').catch(() => { /* best-effort */ })
-						.then(() => {
-							const crates = [...(this.session.getWhitelistEnabledCrates?.() ?? [])];
-							if (newGroupName && !crates.includes(newGroupName)) {
-								crates.push(newGroupName);
-							}
-							const payload = JSON.stringify({ enabled_crates: crates });
-							return this.session.miDebugger.sendCliCommand(
-								`ardb-update-whitelist ${payload}`
-							).catch(() => { /* best-effort */ });
-						})
-						.then(() => this.session.miDebugger.sendCliCommand('ardb-load-whitelist').catch(() => { /* best-effort */ }))
-						.then(() => {
-							// Auto-trace the user crate's async symbols so user-space
-							// coroutines enter the shadow stack; ardb-get-snapshot then
-							// appends the kernel frames via the physical stack tail.
-							return this.session.miDebugger.sendCliCommand(
-								`ardb-trace-user-crate ${newGroupName}`
-							).catch(() => { /* best-effort */ });
-						});
+					const firstEnter = !this.session.getWhitelistInitializedGroups?.().has(newGroupName);
+					const dirty = this.session.isWhitelistDirty?.() ?? false;
+					if (!firstEnter && !dirty) {
+						return;
+					}
+					this.session.showInformationMessage(`[DIAG] whitelist rebuild (first=${firstEnter}, dirty=${dirty})...`);
+					const send = (cmd: string): Promise<string> =>
+						this.session.sendCliCommandAndGetOutput ? this.session.sendCliCommandAndGetOutput(cmd) : Promise.resolve('');
+					return (async () => {
+						const outputs: string[] = [];
+						if (firstEnter) {
+							outputs.push(await send('ardb-gen-whitelist'));
+						}
+						const crates = [...(this.session.getWhitelistEnabledCrates?.() ?? [])];
+						if (newGroupName && !crates.includes(newGroupName)) {
+							crates.push(newGroupName);
+						}
+						const payload = JSON.stringify({ enabled_crates: crates });
+						outputs.push(await send(`ardb-update-whitelist ${payload}`));
+						outputs.push(await send('ardb-load-whitelist'));
+						outputs.push(await send(`ardb-trace-user-crate ${newGroupName}`));
+
+						// 全部成功标志齐了才标记初始化/清 dirty；任一步失败则不标记，
+						// 下一次切换重试整条链。
+						const all = outputs.join('\n');
+						const genOk = !firstEnter || all.includes('[ARD] wrote grouped whitelist:') || all.includes('[ARD] whitelist cache hit');
+						const updateOk = all.includes('[ARD] whitelist updated:');
+						const traceOk = all.includes('[ARD] trace-user-crate ');
+						if (genOk && updateOk && traceOk) {
+							this.session.markWhitelistGroupInitialized?.(newGroupName);
+							this.session.clearWhitelistDirty?.();
+						}
+					})().catch(() => { /* best-effort：失败不标记，下次切换重试 */ });
 				});
 			})
 			.then(() => {

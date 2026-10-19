@@ -186,6 +186,11 @@ export class GDBDebugSession extends DebugSession {
     // Crates the user enabled via ardb-update-whitelist — re-applied after
     // group switches regenerate the whitelist (user symbols enter scope).
     private whitelistEnabledCrates: string[] = [];
+    // 已完成白名单首次初始化的用户组——组切换时据此跳过冗余的
+    // gen→update→load→trace-user-crate 四连（依赖 restore 恢复白名单与入口断点）。
+    private whitelistInitializedGroups: Set<string> = new Set();
+    // 用户在 UI 改过 enabled crates → 下一次组切换需重跑 update+load。
+    private whitelistDirty: boolean = false;
 
     constructor(opts: GDBDebugSessionOptions) {
         super();
@@ -335,6 +340,22 @@ export class GDBDebugSession extends DebugSession {
             },
             getWhitelistEnabledCrates(): string[] {
                 return self.whitelistEnabledCrates;
+            },
+            getWhitelistInitializedGroups(): Set<string> {
+                return self.whitelistInitializedGroups;
+            },
+            markWhitelistGroupInitialized(group: string): void {
+                self.whitelistInitializedGroups.add(group);
+            },
+            isWhitelistDirty(): boolean {
+                return self.whitelistDirty;
+            },
+            clearWhitelistDirty(): void {
+                self.whitelistDirty = false;
+            },
+            sendCliCommandAndGetOutput(command: string): Promise<string> {
+                if (!self.miDebugger) { return Promise.resolve(''); }
+                return self.miDebugger.sendCliCommand(command).then((record) => self.getConsoleOutput(record));
             },
         };
 
@@ -1140,6 +1161,10 @@ export class GDBDebugSession extends DebugSession {
     private async handleArdReset(response: DebugProtocol.Response): Promise<void> {
         if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         await this.miDebugger.sendCliCommand('ardb-reset');
+        // Python 侧的 saved state 已被 ardb-reset 清空，TS 侧的白名单瘦身
+        // 状态（已初始化组、dirty）必须同步清空，否则下次切换会错误跳过重建。
+        this.whitelistInitializedGroups.clear();
+        this.whitelistDirty = false;
         // Clean up debug artifacts produced during the session:
         // trace logs, snapshot, whitelist files. They are regenerated lazily
         // by the GDB Python side / whitelist commands on next use.
@@ -1205,6 +1230,9 @@ export class GDBDebugSession extends DebugSession {
         if (!this.miDebugger) { response.body = {}; this.sendResponse(response); return; }
         const enabledCrates = args?.enabledCrates || [];
         this.whitelistEnabledCrates = enabledCrates;
+        // 白名单内容将变化：已装的 callsite 断点与已初始化组的白名单都过期，
+        // 置 dirty 让下一次组切换重跑 update+load（Python 侧会清空 callsite 集合）。
+        this.whitelistDirty = true;
         const payload = JSON.stringify({ enabled_crates: enabledCrates });
         await this.miDebugger.sendCliCommand(`ardb-update-whitelist ${payload}`);
         response.body = {};
