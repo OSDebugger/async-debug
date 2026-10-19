@@ -281,6 +281,7 @@ _WHITELIST_PATH = None
 # addr map only for exact symbols (PIE/ASLR-safe per-run)
 _WHITELIST_ADDR_MAP = {}             # addr -> exact symbol
 _WHITELIST_ADDR_READY = False
+_WHITELIST_ADDR_OBJFILES = set()     # 地址表符号所属 objfile 的文件名集合（构建时记录）
 
 # Async symbol set from grouped whitelist (symbols classified as "async")
 _ASYNC_SYMBOL_SET = None   # set[str] | None
@@ -634,9 +635,10 @@ def _load_whitelist_file(path: str):
     return exact, prefix
 
 def _invalidate_whitelist_addrs():
-    global _WHITELIST_ADDR_MAP, _WHITELIST_ADDR_READY
+    global _WHITELIST_ADDR_MAP, _WHITELIST_ADDR_READY, _WHITELIST_ADDR_OBJFILES
     _WHITELIST_ADDR_MAP = {}
     _WHITELIST_ADDR_READY = False
+    _WHITELIST_ADDR_OBJFILES = set()
 
 def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
     try:
@@ -645,7 +647,7 @@ def _try_addr_by_lookup_global_symbol(name: str) -> int | None:
             return None
         v = sym.value()
         voidp = gdb.lookup_type("char").pointer()
-        return int(v.cast(charp))
+        return int(v.cast(voidp))
     except Exception:
         return None
 
@@ -684,7 +686,7 @@ def _whitelist_allows_by_name(sym: str) -> str | None:
     return None
 
 def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
-    global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_MAP
+    global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_MAP, _WHITELIST_ADDR_OBJFILES
 
     # addr-map only for exact symbols
     if _WHITELIST_EXACT is None or _WHITELIST_ADDR_READY:
@@ -693,9 +695,22 @@ def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
     resolved = 0
     total = len(_WHITELIST_EXACT)
     addr_map = {}
+    objfiles: set[str] = set()
 
     for name in _WHITELIST_EXACT:
-        addr = _try_addr_by_lookup_global_symbol(name)
+        # 一次 lookup 同时拿地址与所属 objfile（构建时记录 objfile，
+        # 供 save/restore 的多 objfile 检测使用）
+        addr = None
+        try:
+            sym = gdb.lookup_global_symbol(name)
+            if sym is not None:
+                addr = int(sym.value().cast(gdb.lookup_type("char").pointer()))
+                try:
+                    objfiles.add(sym.symtab.objfile.filename)
+                except Exception:
+                    pass
+        except Exception:
+            addr = None
         if addr is None:
             addr = _try_addr_by_info_address(name)
         if addr is None:
@@ -704,6 +719,7 @@ def _build_whitelist_addr_map_if_needed(caller_is_user_visible: bool):
         resolved += 1
 
     _WHITELIST_ADDR_MAP = addr_map
+    _WHITELIST_ADDR_OBJFILES = objfiles
     _WHITELIST_ADDR_READY = True
 
     if caller_is_user_visible and PRINT_WHITELIST_ADDR_STATS:
@@ -714,6 +730,26 @@ def _whitelist_allows_by_addr(target_addr: int) -> str | None:
     if _WHITELIST_EXACT is None or not _WHITELIST_ADDR_READY:
         return None
     return _WHITELIST_ADDR_MAP.get(int(target_addr))
+
+def _shift_addr_map(addr_map: dict, delta: int) -> dict:
+    """把地址表整体平移 delta（同一 ELF 换基址时使用）。"""
+    if delta == 0:
+        return dict(addr_map)
+    return {a + delta: name for a, name in addr_map.items()}
+
+def _resolve_anchor_delta(cached_map: dict) -> int | None:
+    """锚点校验：解析缓存表中最小地址符号的当前地址，返回新址与旧址之差。
+    None = 无法解析（放弃复用，回退懒重建）。"""
+    if not cached_map:
+        return None
+    old_addr = min(cached_map.keys())
+    name = cached_map[old_addr]
+    new_addr = _try_addr_by_lookup_global_symbol(name)
+    if new_addr is None:
+        new_addr = _try_addr_by_info_address(name)
+    if new_addr is None:
+        return None
+    return new_addr - old_addr
 
 # -------------------------
 # Logging helpers (runtime)
@@ -1726,6 +1762,7 @@ class ARDSaveTraceStateCommand(gdb.Command):
             ),
             "whitelist_addr_map": dict(_WHITELIST_ADDR_MAP),
             "whitelist_addr_ready": _WHITELIST_ADDR_READY,
+            "whitelist_objfile_names": sorted(_WHITELIST_ADDR_OBJFILES),
             "async_symbol_set": (
                 set(_ASYNC_SYMBOL_SET) if _ASYNC_SYMBOL_SET is not None else None
             ),
@@ -1777,14 +1814,30 @@ class ARDRestoreTraceStateCommand(gdb.Command):
         _DIAG_LOG(f"[DIAG]   state['poll_entries'] count = {len(state.get('poll_entries', []))}")
         _DIAG_LOG(f"[DIAG]   current _CALLSITE_INSTALLED_FOR_FN (before restore) = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
 
-        # 1. Restore whitelist (address map must be rebuilt for new symbols).
+        # 1. Restore whitelist（地址表带锚点校验复用，见设计文档 §6.2）。
         global _WHITELIST_EXACT, _WHITELIST_PREFIX, _WHITELIST_ADDR_MAP
-        global _WHITELIST_ADDR_READY, _ASYNC_SYMBOL_SET
+        global _WHITELIST_ADDR_READY, _WHITELIST_ADDR_OBJFILES, _ASYNC_SYMBOL_SET
         _WHITELIST_EXACT = state["whitelist_exact"]
         _WHITELIST_PREFIX = state["whitelist_prefix"]
-        _WHITELIST_ADDR_READY = False
-        _WHITELIST_ADDR_MAP = {}
         _ASYNC_SYMBOL_SET = state["async_symbol_set"]
+
+        cached_map = state.get("whitelist_addr_map") or {}
+        objfile_names = state.get("whitelist_objfile_names") or []
+        reused = False
+        if cached_map and len(objfile_names) == 1:
+            # 单 objfile 才能安全地整体复用/平移；多 objfile 统一平移会改错另一侧地址
+            delta = _resolve_anchor_delta(cached_map)
+            if delta is not None:
+                _WHITELIST_ADDR_MAP = _shift_addr_map(cached_map, delta)
+                _WHITELIST_ADDR_OBJFILES = set(objfile_names)
+                _WHITELIST_ADDR_READY = True
+                reused = True
+        if not reused:
+            _WHITELIST_ADDR_MAP = {}
+            _WHITELIST_ADDR_OBJFILES = set()
+            _WHITELIST_ADDR_READY = False
+        _DIAG_LOG(f"[DIAG]   addr map reused={reused} "
+                  f"(cached={len(cached_map)} entries, objfiles={len(objfile_names)})")
 
         # 2. Restore tracking bookkeeping.
         _ACTIVE_ROOTS.clear()
