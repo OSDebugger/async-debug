@@ -3,11 +3,11 @@ import os
 import re
 import json
 import gdb
+import hashlib
 
 # -------------------------
 # 已知的框架 / 运行时 crate（不属于用户代码）
 # -------------------------
-
 # 仅作为 _detect_user_crate 的兜底：符号缺少文件路径信息时按名字判断。
 # 生态名单不可能穷尽，只收录常见项；有文件路径信息时以路径判断为准。
 
@@ -142,7 +142,6 @@ def _extract_crate_name(symbol: str) -> str:
 def _detect_user_crate(crate_name: str, file_path: str | None) -> bool:
     """
     判断一个 crate 是用户代码还是框架 / 库代码。
-
     判断规则（按优先级）：
     1. 文件路径含 ".cargo/registry" 或 "rustup/toolchains" → 框架
     2. 文件路径以 "src/" 开头，或是不含 .cargo 的相对路径 → 用户 crate
@@ -269,6 +268,53 @@ def gen_grouped_whitelist(out_path: str) -> dict:
     return grouped_data
 
 
+# -------------------------
+# 分组白名单缓存（按符号文件组合）
+# -------------------------
+
+def _current_objfile_key() -> tuple[tuple[str, int], ...]:
+    """当前加载的全部 objfile 的 (文件名, mtime) 元组，按文件名排序。"""
+    entries = set()
+    for objfile in gdb.objfiles():
+        path = objfile.filename
+        try:
+            mtime = int(os.stat(path).st_mtime)
+        except Exception:
+            mtime = 0
+        entries.add((path, mtime))
+    return tuple(sorted(entries))
+
+
+def _cache_file_for_key(key: tuple[tuple[str, int], ...]) -> str:
+    """给定符号组合键，返回对应的缓存文件路径。"""
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        raise RuntimeError("ASYNC_RUST_DEBUGGER_TEMP_DIR is not set")
+    out_dir = os.path.join(os.getcwd(), temp_dir)
+    digest = hashlib.sha1(repr(key).encode()).hexdigest()[:16]
+    return os.path.join(out_dir, "whitelist_cache", f"{digest}.json")
+
+
+def _try_load_cached_grouped(key, grouped_path: str) -> bool:
+    """缓存命中则把缓存内容写入 grouped_path 并返回 True。"""
+    cache_file = _cache_file_for_key(key)
+    if not os.path.exists(cache_file):
+        return False
+    with open(cache_file, "r", encoding="utf-8") as fp:
+        content = fp.read()
+    with open(grouped_path, "w", encoding="utf-8") as fp:
+        fp.write(content)
+    return True
+
+
+def _cache_grouped(key, grouped_data: dict, grouped_path: str):
+    """把 grouped 数据写入缓存副本（grouped_path 供 UI/固定路径读取）。"""
+    cache_file = _cache_file_for_key(key)
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    with open(cache_file, "w", encoding="utf-8") as fp:
+        json.dump(grouped_data, fp, indent=2, ensure_ascii=False)
+
+
 def gen_default_whitelist():
     temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
     if not temp_dir:
@@ -276,9 +322,14 @@ def gen_default_whitelist():
     cwd = os.getcwd()
     out_dir = os.path.join(cwd, temp_dir)
 
-    # 1. 生成分组 JSON（供 UI 展示全部函数）
+    # 1. 生成分组 JSON（供 UI 展示全部函数）；同符号组合已缓存则跳过全量扫描
     grouped_path = os.path.join(out_dir, "poll_functions_grouped.json")
-    gen_grouped_whitelist(grouped_path)
+    key = _current_objfile_key()
+    if _try_load_cached_grouped(key, grouped_path):
+        gdb.write(f"[ARD] whitelist cache hit -> {grouped_path}\n")
+    else:
+        grouped_data = gen_grouped_whitelist(grouped_path)
+        _cache_grouped(key, grouped_data, grouped_path)
 
     # 2. 生成空的扁平白名单（默认不启用任何 crate，由用户在 UI 中手动选择）
     flat_path = os.path.join(out_dir, "poll_functions.txt")

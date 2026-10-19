@@ -593,6 +593,21 @@ def _default_whitelist_path() -> str | None:
         return None
     return os.path.join(cwd, temp_dir, "poll_functions.txt")
 
+def _grouped_json_path() -> str:
+    """按当前 objfile 组合定位 grouped JSON：缓存文件优先，回退固定路径。"""
+    from async_rust_debugger.static_analysis import gen_whitelist
+    temp_dir = os.environ.get("ASYNC_RUST_DEBUGGER_TEMP_DIR")
+    if not temp_dir:
+        raise RuntimeError("ASYNC_RUST_DEBUGGER_TEMP_DIR is not set")
+    fixed = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+    try:
+        cache_file = gen_whitelist._cache_file_for_key(gen_whitelist._current_objfile_key())
+        if os.path.exists(cache_file):
+            return cache_file
+    except Exception:
+        pass
+    return fixed
+
 def _load_whitelist_file(path: str):
     """
     Supports:
@@ -1151,7 +1166,7 @@ class ARDTraceUserCrateCommand(gdb.Command):
             gdb.write('[ARD] ASYNC_RUST_DEBUGGER_TEMP_DIR is not set.\n')
             return
 
-        grouped_path = os.path.join(os.getcwd(), temp_dir, "poll_functions_grouped.json")
+        grouped_path = _grouped_json_path()
         if not os.path.exists(grouped_path):
             gdb.write('[ARD] grouped whitelist not found. Run ardb-gen-whitelist first.\n')
             return
@@ -1554,7 +1569,7 @@ class ARDUpdateWhitelistCommand(gdb.Command):
             return
 
         cwd = os.getcwd()
-        grouped_path = os.path.join(cwd, temp_dir, "poll_functions_grouped.json")
+        grouped_path = _grouped_json_path()
         flat_path = os.path.join(cwd, temp_dir, "poll_functions.txt")
 
         if not os.path.exists(grouped_path):
