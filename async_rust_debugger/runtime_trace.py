@@ -271,6 +271,7 @@ _CREATED_BPS = []
 _RUN_SCOPED_BPS = []
 
 _CALLSITE_INSTALLED_FOR_FN = set()   # per-run: avoid re-installing callsite BPs
+_CALLSITE_ADDRS_BY_FN: dict[str, list[int]] = {}  # 函数名 -> 已装 callsite 地址（save/restore 用）
 _ACTIVE_ROOTS = set()                # poll symbols we installed PollEntryBP for
 
 # whitelist: exact + prefix(*)
@@ -970,6 +971,7 @@ def _cleanup_run_scoped():
     _RUN_SCOPED_BPS.clear()
 
     _CALLSITE_INSTALLED_FOR_FN.clear()
+    _CALLSITE_ADDRS_BY_FN.clear()
     _invalidate_whitelist_addrs()
 
     _TLS_STACK.clear()
@@ -1101,6 +1103,7 @@ class PollEntryBP(gdb.Breakpoint):
                 CallSiteBP(a)
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
+            _CALLSITE_ADDRS_BY_FN[fn] = list(call_sites)
             _DIAG_LOG(f"[DIAG] PollEntryBP.stop(): installed {len(call_sites)} CallSiteBPs for '{fn}'")
             if (not self.internal) or PRINT_INTERNAL_POLL_HITS:
                 _log_ard(f"[ARD]{indent} call-sites: {len(call_sites)}")
@@ -1252,6 +1255,7 @@ class ARDResetCommand(gdb.Command):
         _RUN_SCOPED_BPS.clear()
 
         _CALLSITE_INSTALLED_FOR_FN.clear()
+        _CALLSITE_ADDRS_BY_FN.clear()
         _ACTIVE_ROOTS.clear()
         _SAVED_STATES.clear()
 
@@ -1658,6 +1662,21 @@ class ARDUpdateWhitelistCommand(gdb.Command):
             gdb.write(f'[ARD] failed to reload whitelist: {e}\n')
             return
 
+        # 白名单变了，已装的 callsite 断点全部过期：删除并清空集合，
+        # 下次 poll 命中时按新白名单重扫重装（防重复插桩）。
+        for bp in list(_CREATED_BPS):
+            if isinstance(bp, CallSiteBP):
+                try:
+                    bp.delete()
+                except Exception:
+                    pass
+                if bp in _CREATED_BPS:
+                    _CREATED_BPS.remove(bp)
+                if bp in _RUN_SCOPED_BPS:
+                    _RUN_SCOPED_BPS.remove(bp)
+        _CALLSITE_INSTALLED_FOR_FN.clear()
+        _CALLSITE_ADDRS_BY_FN.clear()
+
         gdb.write(f'[ARD] whitelist updated: {len(enabled_crates)} crates enabled, {idx} symbols -> {flat_path}\n')
 
 
@@ -1754,6 +1773,9 @@ class ARDSaveTraceStateCommand(gdb.Command):
         state = {
             "active_roots": set(_ACTIVE_ROOTS),
             "callsite_installed": set(_CALLSITE_INSTALLED_FOR_FN),
+            "callsite_addrs_by_fn": {
+                fn: list(addrs) for fn, addrs in _CALLSITE_ADDRS_BY_FN.items()
+            },
             "whitelist_exact": (
                 set(_WHITELIST_EXACT) if _WHITELIST_EXACT is not None else None
             ),
@@ -1824,6 +1846,7 @@ class ARDRestoreTraceStateCommand(gdb.Command):
         cached_map = state.get("whitelist_addr_map") or {}
         objfile_names = state.get("whitelist_objfile_names") or []
         reused = False
+        reuse_delta = None
         if cached_map and len(objfile_names) == 1:
             # 单 objfile 才能安全地整体复用/平移；多 objfile 统一平移会改错另一侧地址
             delta = _resolve_anchor_delta(cached_map)
@@ -1832,6 +1855,7 @@ class ARDRestoreTraceStateCommand(gdb.Command):
                 _WHITELIST_ADDR_OBJFILES = set(objfile_names)
                 _WHITELIST_ADDR_READY = True
                 reused = True
+                reuse_delta = delta
         if not reused:
             _WHITELIST_ADDR_MAP = {}
             _WHITELIST_ADDR_OBJFILES = set()
@@ -1911,6 +1935,23 @@ class ARDRestoreTraceStateCommand(gdb.Command):
                     f"[ARD] restore: failed to re-install PollEntryBP "
                     f"at '{location}': {e}\n"
                 )
+
+        # 5.5 Re-install CallSiteBP from saved addresses（仅 delta==0，地址仍有效）。
+        #     否则清空集合，下次 poll 命中时按当前符号表重扫重装。
+        if reuse_delta == 0:
+            callsite_restored = 0
+            for addrs in state.get("callsite_addrs_by_fn", {}).values():
+                for a in addrs:
+                    try:
+                        CallSiteBP(int(a))
+                        callsite_restored += 1
+                    except Exception:
+                        pass
+            _DIAG_LOG(f"[DIAG]   callsites restored: {callsite_restored}")
+        else:
+            _CALLSITE_INSTALLED_FOR_FN.clear()
+            _CALLSITE_ADDRS_BY_FN.clear()
+            _DIAG_LOG("[DIAG]   callsites NOT restored (delta!=0/unresolved) -> rescan on next poll")
 
         coro_count = len(_CO_BY_KEY)
         gdb.write(
