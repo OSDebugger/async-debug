@@ -15,10 +15,11 @@ import async_rust_debugger.runtime_trace as rt
 def test_mnemonic_regex_coverage():
     matches = (
         "call 0x1234", "callq *%rax", "callplt 0x100",
-        "jal ra, 0x8020", "jalr ra, 16(a0)", "c.jalr a0",
+        "jal ra, 0x8020", "jalr ra, 16(a0)", "jalr ra", "jalr a5",
+        "jalr 874(ra)", "jalr -774(ra)", "c.jalr a0",
         "bl 0x4000", "blr x30",
     )
-    non_matches = ("ret", "c.jr ra", "jalr zero, 0(ra)")
+    non_matches = ("ret", "c.jr ra", "jalr zero, 0(ra)", "jr a5")
     ok = True
     for s in matches:
         if not rt.CALL_MNEMONIC_RE.match(s):
@@ -49,6 +50,32 @@ def test_direct_call_target():
         gdb.write("  OK: direct call target extraction\n")
     else:
         gdb.write("  FAIL: direct call target extraction\n")
+    return ok
+
+
+def test_jalr_operands():
+    """jalr 各反汇编形态的纯解析（基址寄存器, 位移）。
+    调试机实测格式（riscv64-unknown-elf-gdb）："jalr 874(ra)"——无逗号、
+    位移+括号基址寄存器，可为负；其余形态防御性覆盖。"""
+    try:
+        p = rt._jalr_operands_from_asm
+    except AttributeError as e:
+        gdb.write(f"  FAIL: _jalr_operands_from_asm missing: {e}\n")
+        return False
+    ok = (
+        p("jalr 874(ra)") == ("ra", 874)
+        and p("jalr -774(ra)") == ("ra", -774)
+        and p("jalr ra, 16(a0)") == ("a0", 16)
+        and p("jalr a5") == ("a5", 0)
+        and p("jalr ra") == ("ra", 0)
+        and p("c.jalr a5") == ("a5", 0)
+        and p("jal ra, 0x8020") is None
+        and p("call 0x1234") is None
+    )
+    if ok:
+        gdb.write("  OK: jalr operand parsing (real no-comma form + comma variant + zero-offset + c.jalr)\n")
+    else:
+        gdb.write("  FAIL: jalr operand parsing wrong\n")
     return ok
 
 
@@ -132,6 +159,7 @@ def main():
     results = [
         ("mnemonic_regex_coverage", test_mnemonic_regex_coverage()),
         ("direct_call_target", test_direct_call_target()),
+        ("jalr_operands", test_jalr_operands()),
         ("should_install_callsite_paths", test_should_install_callsite_paths()),
     ]
     passed = sum(1 for _, ok in results if ok)

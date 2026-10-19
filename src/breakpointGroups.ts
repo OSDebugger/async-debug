@@ -337,11 +337,15 @@ export class BreakpointGroups {
 				this.session.onBreakpointsRestored(flat);
 
 				// 5. Restore async trace state for the new group.
+				// 缺 sendCliCommandAndGetOutput 的旧式 session 退回 sendCliCommand
+				// （命令必须照发，仅拿不到输出——restoreOk 判为失败走自愈链条）。
+				const send = (cmd: string): Promise<string> =>
+					this.session.sendCliCommandAndGetOutput
+						? this.session.sendCliCommandAndGetOutput(cmd)
+						: this.session.miDebugger.sendCliCommand(cmd).then(() => '').catch(() => '');
 				this.session.showInformationMessage(`[DIAG] restoring trace state for '${newGroupName}'...`);
-				return this.session.miDebugger.sendCliCommand(
-					`ardb-restore-trace-state ${newGroupName}`
-				).catch(() => { /* best-effort */ })
-				.then(() => {
+				return send(`ardb-restore-trace-state ${newGroupName}`).catch(() => '')
+				.then((restoreOut) => {
 					this.session.osProfiler?.markStep(profCtx, 'restore_state');
 					// 5.5 白名单重建四连只在「首次进入该用户组」或「用户在 UI 改过
 					//     enabled crates（dirty）」时执行；后续切回依赖 restore-trace-state
@@ -351,12 +355,14 @@ export class BreakpointGroups {
 					}
 					const firstEnter = !this.session.getWhitelistInitializedGroups?.().has(newGroupName);
 					const dirty = this.session.isWhitelistDirty?.() ?? false;
-					if (!firstEnter && !dirty) {
+					// restore 未成功（saved state 缺失）时不能跳过四连：否则该组的
+					// 白名单/入口断点会永久丢失（旧行为靠每次四连自愈）。此时重跑
+					// 链条自愈，标记保持幂等。
+					const restoreOk = restoreOut.includes('[ARD] restored trace state');
+					if (!firstEnter && !dirty && restoreOk) {
 						return;
 					}
-					this.session.showInformationMessage(`[DIAG] whitelist rebuild (first=${firstEnter}, dirty=${dirty})...`);
-					const send = (cmd: string): Promise<string> =>
-						this.session.sendCliCommandAndGetOutput ? this.session.sendCliCommandAndGetOutput(cmd) : Promise.resolve('');
+					this.session.showInformationMessage(`[DIAG] whitelist rebuild (first=${firstEnter}, dirty=${dirty}, restoreOk=${restoreOk})...`);
 					return (async () => {
 						const outputs: string[] = [];
 						if (firstEnter) {

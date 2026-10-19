@@ -354,8 +354,10 @@ export class GDBDebugSession extends DebugSession {
                 self.whitelistDirty = false;
             },
             sendCliCommandAndGetOutput(command: string): Promise<string> {
+                // 用 captureConsoleOutput 收集 console 流输出（getConsoleOutput 依赖的
+                // _consoleOutput 字段没有写入点，恒为空——审查发现 C1）。
                 if (!self.miDebugger) { return Promise.resolve(''); }
-                return self.miDebugger.sendCliCommand(command).then((record) => self.getConsoleOutput(record));
+                return self.miDebugger.captureConsoleOutput(command).catch(() => '');
             },
         };
 

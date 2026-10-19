@@ -300,9 +300,10 @@ _SAVED_STATES: dict[str, dict] = {}
 
 CALL_MNEMONIC_RE = re.compile(
     # x86 call/callq/callplt；RISC-V call 伪指令由 "call" 覆盖、jal（直接）、
-    # jalr（间接，rd=zero 是 tail call 不记录）、压缩形式 c.jalr/c.j；
+    # jalr（间接，rd=zero 是 tail call 不记录；调试机实测格式 "jalr 874(ra)" /
+    # "jalr -774(ra)"，位移可为负故不能依赖尾部词边界）、压缩形式 c.jalr/c.j；
     # AArch64 bl（直接）/blr（间接）
-    r"^\s*(?:call\w*|jalr\s+(?!zero\b)|jal\b|c\.jalr|c\.j|bl\b|blr\b)\b",
+    r"^\s*(?:call\w*|jalr\s+(?!zero\b)|jal\b|c\.jalr|c\.j\b|bl\b|blr\b)",
     re.IGNORECASE)
 HEX_ADDR_RE = re.compile(r"(0x[0-9a-fA-F]+)")
 
@@ -494,6 +495,40 @@ def _current_asm() -> str:
             return ins.get("asm", "")
     return gdb.execute("x/i $pc", to_string=True).strip()
 
+def _jalr_operands_from_asm(asm: str) -> tuple[str, int] | None:
+    """解析 RISC-V jalr 反汇编形态，返回 (基址寄存器, 位移)。None = 非 jalr。
+
+    调试机实测格式（riscv64-unknown-elf-gdb）："jalr 874(ra)" / "jalr -774(ra)"
+    ——无逗号、位移+括号基址寄存器（Rust/RISC-V 的调用基本全走 auipc+jalr，
+    反汇编器解析成该形态）；其余形态做防御性覆盖。"""
+    s = asm.strip()
+
+    # 实测主形态：jalr off(reg)
+    m = re.search(r"jalr\s+([\-0-9a-fx]+)\((\w+)\)", s)
+    if m:
+        off_s, reg = m.group(1), m.group(2)
+        off = int(off_s, 16) if off_s.startswith(("0x", "-0x")) else int(off_s, 10)
+        return reg, off
+
+    # 带逗号的变体：jalr rd, off(reg)
+    m = re.search(r"jalr\s+\w+\s*,\s*([\-0-9a-fx]+)\((\w+)\)", s)
+    if m:
+        off_s, reg = m.group(1), m.group(2)
+        off = int(off_s, 16) if off_s.startswith(("0x", "-0x")) else int(off_s, 10)
+        return reg, off
+
+    # 零偏移缩写：jalr reg
+    m = re.match(r"jalr\s+(\w+)\s*$", s)
+    if m:
+        return m.group(1), 0
+
+    # 压缩形式：c.jalr rs
+    m = re.match(r"c\.jalr\s+(\w+)\s*$", s)
+    if m:
+        return m.group(1), 0
+
+    return None
+
 def _resolve_call_target_from_asm(asm: str) -> int | None:
     s = asm.strip()
 
@@ -532,17 +567,11 @@ def _resolve_call_target_from_asm(asm: str) -> int | None:
             return int(m.group(1), 16)
         return None
 
-    # RISC-V: jalr rd, off(reg) —— 间接调用，命中时读寄存器
-    m = re.search(r"jalr\s+\w+\s*,\s*([\-0-9a-fx]+)\((\w+)\)", s)
-    if m:
-        off_s, reg = m.group(1), m.group(2)
-        off = int(off_s, 16) if off_s.startswith(("0x", "-0x")) else int(off_s, 10)
+    # RISC-V: jalr 的多种反汇编形态 → 目标 = 基址寄存器 + 位移
+    operands = _jalr_operands_from_asm(s)
+    if operands is not None:
+        reg, off = operands
         return _reg_u64(reg) + off
-
-    # RISC-V 压缩形式: c.jalr rs —— 间接调用，目标在 rs
-    m = re.search(r"c\.jalr\s+(\w+)", s)
-    if m:
-        return _reg_u64(m.group(1))
 
     return None
 
