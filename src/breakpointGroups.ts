@@ -253,38 +253,19 @@ export class BreakpointGroups {
 		// (break-delete by function name is not supported by GDB, and the stored
 		// gdbNumber was reset before the delete could run).
 
-		// 2. Unload old symbol files, load new symbol files — must complete before
-		//    re-inserting breakpoints so GDB can resolve source locations correctly.
-		//
-		//    Only manage files that were loaded via addSymbolFile (tracked in
-		//    loadedSymbolFiles). The primary executable loaded by GDB's
-		//    file-exec-and-symbols is NOT tracked and should never be removed.
-		const oldSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(oldGroupName);
+		// 2. Symbol files are resident: loaded once on first need, never removed.
+		//    （符号常驻——每文件仅首次需要时 addSymbolFile 一次，永不 remove。）
 		const newSymbolFiles: SymbolFileEntry[] = eval(this.session.breakpointGroupNameToDebugFilePaths)(newGroupName);
 
 		const toPath = (e: SymbolFileEntry) => typeof e === 'string' ? e : e.path;
 		const toTextAddr = (e: SymbolFileEntry) => typeof e === 'string' ? undefined : e.textAddr;
 
-		// Only remove files we previously loaded via addSymbolFile.
-		// The primary executable (kernel ELF, loaded via file-exec-and-symbols)
-		// is never in loadedSymbolFiles and thus never touched.
-		const filesToRemove = oldSymbolFiles.map(toPath).filter(p => this.loadedSymbolFiles.has(p));
+		// 首次加载：只 add 尚未加载过的文件；loadedSymbolFiles 只增不减。
 		const filesToAdd = newSymbolFiles.filter(e => !this.loadedSymbolFiles.has(toPath(e)));
 
 		return Promise.all([...clearOldPromises, ...clearOldFuncBorderPromises])
 			.then(() => {
 				this.session.osProfiler?.markStep(profCtx, 'clear_bps');
-				return Promise.all(filesToRemove.map(p =>
-					this.session.miDebugger.removeSymbolFile(p).then(() => {
-						this.loadedSymbolFiles.delete(p);
-					}).catch(err => {
-						console.error('[ardb] removeSymbolFile failed:', err);
-						this.loadedSymbolFiles.delete(p);  // remove from tracking even on failure
-					})
-				));
-			})
-			.then(() => {
-				this.session.osProfiler?.markStep(profCtx, 'unload_symbols');
 				return Promise.all(filesToAdd.map(f =>
 					this.session.miDebugger.addSymbolFile(toPath(f), toTextAddr(f)).then((ok) => {
 						if (ok) this.loadedSymbolFiles.add(toPath(f));
@@ -350,7 +331,9 @@ export class BreakpointGroups {
 					// 5.5 白名单重建四连只在「首次进入该用户组」或「用户在 UI 改过
 					//     enabled crates（dirty）」时执行；后续切回依赖 restore-trace-state
 					//     已恢复的白名单与入口断点，整条链跳过。
-					if (filesToAdd.length === 0) {
+					// 用户组探测器：符号常驻后 filesToAdd 仅首次非空，改用
+					// "该组是否配置了符号文件"判断是否用户组（内核组无文件）。
+					if (newSymbolFiles.length === 0) {
 						return;
 					}
 					const firstEnter = !this.session.getWhitelistInitializedGroups?.().has(newGroupName);
