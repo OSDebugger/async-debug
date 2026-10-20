@@ -108,12 +108,54 @@ def test_in_addr_ranges():
     return False
 
 
+def test_first_activation_preserves_pre_activation_state():
+    """首次激活不得丢弃激活前建立的全局状态（launch 模式白名单在首次停止前就绪）。"""
+    rt._PROGRAM_STATES.clear()
+    rt._active_program = None
+    rt._WHITELIST_EXACT = {"pre::fn"}
+    rt._ASYNC_SYMBOL_SET = {"pre::fn"}
+    rt._ACTIVE_ROOTS.add("pre::root")
+
+    rt._activate_program("launch_user")
+
+    ok = (rt._WHITELIST_EXACT == {"pre::fn"}
+          and rt._ASYNC_SYMBOL_SET == {"pre::fn"}
+          and "pre::root" in rt._ACTIVE_ROOTS)
+    if ok:
+        gdb.write("  OK: first activation preserves pre-activation state\n")
+        return True
+    gdb.write(f"  FAIL: state wiped — exact={rt._WHITELIST_EXACT}, async={rt._ASYNC_SYMBOL_SET}\n")
+    return False
+
+
+def test_save_snapshots_label_bucket():
+    """save 必须序列化 label 桶的状态，而非当前全局（当前全局可能属于另一程序）。"""
+    rt._PROGRAM_STATES.clear()
+    rt._active_program = None
+    rt._activate_program("prog_a")
+    rt._WHITELIST_EXACT = {"a::fn"}
+    rt._activate_program("prog_b")
+    rt._WHITELIST_EXACT = {"b::fn"}
+
+    gdb.execute("ardb-save-trace-state prog_a")
+
+    saved = rt._SAVED_STATES.get("prog_a")
+    ok = saved is not None and saved.get("whitelist_exact") == {"a::fn"}
+    if ok:
+        gdb.write("  OK: save snapshots label bucket (not current globals)\n")
+        return True
+    gdb.write(f"  FAIL: saved={saved.get('whitelist_exact') if saved else None}\n")
+    return False
+
+
 def main():
     gdb.write("[test] program state buckets\n")
     results = [
         ("activate_swaps_state_between_programs", test_activate_swaps_state_between_programs()),
         ("activate_fresh_program_gets_empty_bucket", test_activate_fresh_program_gets_empty_bucket()),
         ("legacy_saved_state_migrates_or_rebuilds", test_legacy_saved_state_migrates_or_rebuilds()),
+        ("first_activation_preserves_pre_activation_state", test_first_activation_preserves_pre_activation_state()),
+        ("save_snapshots_label_bucket", test_save_snapshots_label_bucket()),
         ("program_name_normalization", test_program_name_normalization()),
         ("in_addr_ranges", test_in_addr_ranges()),
     ]

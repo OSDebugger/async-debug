@@ -21,9 +21,11 @@ def test_breakpoint_allowed_pure():
     rt._active_program = "prog_a"
     ok = (f("") is True
           and f("prog_a") is True
-          and f("prog_b") is False)
+          and f("prog_b") is False
+          and f("/prog_a") is True
+          and f("/prog_b") is False)
     if ok:
-        gdb.write("  OK: breakpoint allowed pure logic\n")
+        gdb.write("  OK: breakpoint allowed pure logic (with name normalization)\n")
         return True
     gdb.write("  FAIL: allowed logic wrong\n")
     return False

@@ -145,6 +145,8 @@ def test_unknown_state_labels():
     if mod is None:
         return False
     label = "__test_pop_behavior__"
+    # 新语义（桶快照）：先激活 label 桶再写入状态，save 序列化的才是该桶
+    mod._activate_program(label)
     mod._WHITELIST_EXACT = {"pop_test"}
     mod._WHITELIST_PREFIX = None
     mod._ACTIVE_ROOTS.clear()

@@ -352,6 +352,10 @@ def _activate_program(name: str) -> None:
         return
     if _active_program is not None:
         _PROGRAM_STATES[_active_program] = _snapshot_bucket()
+    elif name not in _PROGRAM_STATES:
+        # 首次激活：把激活前建立的全局状态播种进目标桶（launch 模式白名单
+        # 在首次停止前就绪，不可丢弃）
+        _PROGRAM_STATES[name] = _snapshot_bucket()
     _active_program = name
     bucket = _PROGRAM_STATES.get(name)
     if bucket is None:
@@ -1210,10 +1214,11 @@ def _on_new_objfile(event):
 # -------------------------
 
 def _breakpoint_allowed(program: str) -> bool:
-    """断点程序门控：空归属（内核断点）= 放行；否则必须等于当前激活程序。"""
+    """断点程序门控：空归属（内核断点）= 放行；否则必须等于当前激活程序。
+    两侧都做程序名归一化（task 名可能带前导 "/"）。"""
     if not program:
         return True
-    return program == _active_program
+    return _normalize_program_name(program) == _normalize_program_name(_active_program or "")
 
 
 class PollEntryBP(gdb.Breakpoint):
@@ -1968,6 +1973,10 @@ class ARDSaveTraceStateCommand(gdb.Command):
         if not label:
             gdb.write("[ARD] Usage: ardb-save-trace-state <label>\n")
             return
+
+        # 快照前先激活 label 桶：当前全局可能属于另一程序（例如内核断点刚命中过，
+        # 门控已把全局切到 kernel 桶），直接序列化会把错程序的状态写进 label 槽。
+        _activate_program(label)
 
         _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': BEGIN")
         _DIAG_LOG(f"[DIAG]   _CALLSITE_INSTALLED_FOR_FN = {sorted(_CALLSITE_INSTALLED_FOR_FN)}")
