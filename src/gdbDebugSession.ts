@@ -175,6 +175,9 @@ export class GDBDebugSession extends DebugSession {
     public osProfiler: OsProfiler | null = null;   // experiment B: null when disabled
     private singleStepProfileCtx: SingleStepCtx | null = null;   // active consecutive-single-step run
     private recentStopThreadId = 1;
+    private recentStopBkptNo: number | undefined;   // 最近一次停止的断点号（多核适配用）
+    private singleStepThreadId: number | undefined;  // 特权级过渡单步序列锁定的线程
+    private pendingReenableBps: number[] = [];       // 临时禁用、待恢复的断点号（防断点重入循环）
     private kernelMemoryRanges: string[][] = [];
     private userMemoryRanges: string[][] = [];
     private programCounterId = 32; // RISC-V PC register id
@@ -1434,6 +1437,15 @@ export class GDBDebugSession extends DebugSession {
         this.miDebugger!.on('stopped', (node: MINode) => {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
+            this.recentStopBkptNo = parseInt(node.record('bkptno') || '0') || undefined;
+            // 恢复此前临时禁用的断点（本次停止不是它们之一时恢复，避免重入循环）
+            if (this.pendingReenableBps.length > 0
+                && (!this.recentStopBkptNo || !this.pendingReenableBps.includes(this.recentStopBkptNo))) {
+                for (const n of this.pendingReenableBps) {
+                    this.miDebugger!.sendCliCommand(`enable ${n}`).catch(() => {});
+                }
+                this.pendingReenableBps = [];
+            }
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1602,6 +1614,16 @@ export class GDBDebugSession extends DebugSession {
 
         if (action.type === DebuggerActions.check_if_kernel_yet) {
             this.showInfo('doing action: check_if_kernel_yet');
+            // 多核适配：单步序列只跟踪锁定线程；其他线程的停止静默继续
+            // （外来断点临时禁用，防原地重入刷屏；序列结束后自动恢复）
+            if (this.singleStepThreadId !== undefined && this.recentStopThreadId !== this.singleStepThreadId) {
+                if (this.recentStopBkptNo) {
+                    this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
+                    this.pendingReenableBps.push(this.recentStopBkptNo);
+                }
+                this.miDebugger!.continue();
+                return;
+            }
             this.miDebugger.getSomeRegisterValues([this.programCounterId]).then(regs => {
                 if (!regs || regs.length === 0 || !regs[0]) {
                     console.warn('[ardb] check_if_kernel_yet: no register data, retrying step');
@@ -1622,6 +1644,16 @@ export class GDBDebugSession extends DebugSession {
         }
         else if (action.type === DebuggerActions.check_if_user_yet) {
             this.showInfo('doing action: check_if_user_yet');
+            // 多核适配：单步序列只跟踪锁定线程；其他线程的停止静默继续
+            // （外来断点临时禁用，防原地重入刷屏；序列结束后自动恢复）
+            if (this.singleStepThreadId !== undefined && this.recentStopThreadId !== this.singleStepThreadId) {
+                if (this.recentStopBkptNo) {
+                    this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
+                    this.pendingReenableBps.push(this.recentStopBkptNo);
+                }
+                this.miDebugger!.continue();
+                return;
+            }
             // Read the sepc CSR instead of PC. On RISC-V GDB, stepi may not follow sret
             // into user space (it steps to the next instruction in memory). By reading sepc
             // we can determine the sret target address BEFORE sret actually executes.
@@ -1730,6 +1762,8 @@ export class GDBDebugSession extends DebugSession {
         }
         else if (action.type === DebuggerActions.start_consecutive_single_steps) {
             this.showInfo('doing action: start_consecutive_single_steps');
+            // 多核适配：锁定本次单步序列跟踪的线程（其余线程的停止会被忽略）
+            this.singleStepThreadId = this.recentStopThreadId;
             this.beginSingleStepProfile();
             this.countSingleStepProfile();
             this.miDebugger.stepInstruction();
@@ -1761,11 +1795,15 @@ export class GDBDebugSession extends DebugSession {
             });
         }
         else if (action.type === DebuggerActions.high_level_switch_breakpoint_group_to_low_level) {
+            // 多核适配：过渡完成，解除单步序列的线程锁定
+            this.singleStepThreadId = undefined;
             const highLevelName = this.breakpointGroups!.getCurrentBreakpointGroupName();
             this.breakpointGroups!.updateCurrentBreakpointGroup(this.breakpointGroups!.getNextBreakpointGroup(), true);
             this.breakpointGroups!.setNextBreakpointGroup(highLevelName);
         }
         else if (action.type === DebuggerActions.low_level_switch_breakpoint_group_to_high_level) {
+            // 多核适配：过渡完成，解除单步序列的线程锁定
+            this.singleStepThreadId = undefined;
             const lowLevelName = this.breakpointGroups!.getCurrentBreakpointGroupName();
             const highLevelName = this.breakpointGroups!.getNextBreakpointGroup();
             this.breakpointGroups!.updateCurrentBreakpointGroup(highLevelName, true);
@@ -1822,9 +1860,15 @@ export class GDBDebugSession extends DebugSession {
                 // while still in kernel state, it means the kernel internally
                 // called this function (e.g. during init). This is NOT a real
                 // privilege transition — silently continue.
+                // 多核适配：continue 会原地重入该断点（无限循环）。临时禁用后继续，
+                // 下次停止时由 stopped 处理器自动恢复。
                 const fn = v[0].function;
                 if (fn && this.functionBorderNamesUtoK.some(name => fn.includes(name))) {
                     console.log(`[ardb] U→K border hit in kernel state (fn="${fn}") — internal call, continuing silently`);
+                    if (this.recentStopBkptNo) {
+                        this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
+                        this.pendingReenableBps.push(this.recentStopBkptNo);
+                    }
                     this.pendingBreakpointNode = undefined;
                     this.miDebugger!.continue();
                     return;
