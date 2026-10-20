@@ -24,6 +24,13 @@ export interface IDebuggerBackend {
 // Accepts either a plain path string (backward compat) or an object with an optional textAddr.
 export type SymbolFileEntry = string | { path: string; textAddr?: string };
 
+// 活跃程序集合的差异插拔：只对"新活跃"插入、对"刚离开"移除（禁止全删全插）。
+export function computeActiveSetDiff(prev: Set<string>, next: Set<string>): { insert: string[]; remove: string[] } {
+	const insert = [...next].filter(p => !prev.has(p));
+	const remove = [...prev].filter(p => !next.has(p));
+	return { insert, remove };
+}
+
 export interface IBreakpointGroupsSession {
 	miDebugger: IDebuggerBackend;
 	filePathToBreakpointGroupNames: FunctionString;
@@ -394,6 +401,13 @@ export class BreakpointGroups {
 
 	// there should NOT be a `setCurrentBreakpointGroupName()` because changing the name also
 	// requires changing the breakpoint group itself — that's what `updateCurrentBreakpointGroup()` does.
+	// 程序名 -> 断点组名映射（缺省同名；将来程序名与组名不一致时用此映射）。
+	private programToGroup: Map<string, string> = new Map();
+
+	public programToGroupName(p: string): string {
+		return this.programToGroup.get(p) ?? p;
+	}
+
 	public getCurrentBreakpointGroupName(): string {
 		return this.currentBreakpointGroupName;
 	}

@@ -1480,6 +1480,23 @@ export class GDBDebugSession extends DebugSession {
     // OS debug: state machine + doAction
     // -----------------------------------------------------------------------
 
+    /** 用 vCPU 扫描刷新目标用户程序（为多核并行铺路；失败静默回退 hook 值）。 */
+    private async refreshNextGroupFromVcpuScan(): Promise<void> {
+        if (!this.miDebugger || !this.breakpointGroups) { return; }
+        try {
+            const out = await this.miDebugger.captureConsoleOutput('ardb-get-vcpu-programs');
+            const parsed = this.parseJsonFromOutput(out) as Record<string, string> | undefined;
+            if (parsed) {
+                for (const prog of Object.values(parsed)) {
+                    if (prog && prog !== 'kernel' && prog !== 'unknown') {
+                        this.breakpointGroups.setNextBreakpointGroup(prog);
+                        return;
+                    }
+                }
+            }
+        } catch { /* best-effort：回退 hook 值 */ }
+    }
+
     private osStateTransition(event: OSEvent): void {
         let actions: Action[];
         [this.osState, actions] = stateTransition(OSStateMachine, this.osState, event);
@@ -1637,7 +1654,9 @@ export class GDBDebugSession extends DebugSession {
                     for (const border of borders) {
                         if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
                             matched = true;
-                            this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            this.refreshNextGroupFromVcpuScan().then(() => {
+                                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            });
                             break;
                         }
                     }
@@ -1785,7 +1804,9 @@ export class GDBDebugSession extends DebugSession {
                     for (const border of currentGroup.borders) {
                         if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
                             this.pendingBreakpointNode = undefined;
-                            this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            this.refreshNextGroupFromVcpuScan().then(() => {
+                                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+                            });
                             return;
                         }
                     }

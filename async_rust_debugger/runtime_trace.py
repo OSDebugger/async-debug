@@ -2247,6 +2247,38 @@ class ARDSetMemoryRangesCommand(gdb.Command):
             gdb.write(f"[ARD] failed to parse memory ranges: {e}\n")
 
 
+class ARDGetVcpuProgramsCommand(gdb.Command):
+    """扫描各 GDB 线程（vCPU）的当前程序，输出 {"1": "hello_world", "2": "kernel"}。
+    Usage: ardb-get-vcpu-programs"""
+    def __init__(self):
+        super().__init__("ardb-get-vcpu-programs", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        result = {}
+        prev = None
+        try:
+            inf = gdb.selected_inferior()
+            prev = gdb.selected_thread()
+            for t in inf.threads():
+                try:
+                    t.switch()
+                    pc = _current_pc()
+                    if _in_addr_ranges(pc, _KERNEL_RANGES):
+                        result[str(t.num)] = "kernel"
+                    else:
+                        result[str(t.num)] = _normalize_program_name(_CURRENT_USER_PROGRAM)
+                except Exception:
+                    result[str(t.num)] = "unknown"
+            if prev is not None:
+                try:
+                    prev.switch()
+                except Exception:
+                    pass
+        except Exception as e:
+            gdb.write(f"[ARD] failed to scan vCPUs: {e}\n")
+        gdb.write(json.dumps(result) + "\n")
+
+
 class ARDResetTraceStateCommand(gdb.Command):
     """Discard saved trace state for a label.
     Usage: ardb-reset-trace-state <label>"""
@@ -2317,6 +2349,7 @@ def install():
     ARDResetTraceStateCommand()
     ARDSetCurrentProgramCommand()
     ARDSetMemoryRangesCommand()
+    ARDGetVcpuProgramsCommand()
     ARDDiagCommand()
 
     if not _EVENTS_INSTALLED:
