@@ -391,15 +391,24 @@ def _in_addr_ranges(pc: int, ranges) -> bool:
     return False
 
 
+def _classify_pc(pc: int) -> str:
+    """按 PC 分类程序：内核区间 -> "kernel"；复位向量等保留区（停靠 hart）-> "unknown"；
+    其余（用户区间）-> 事件驱动的当前用户程序。"""
+    if _in_addr_ranges(pc, _KERNEL_RANGES):
+        return "kernel"
+    if pc < 0x2000:
+        # RISC-V 复位向量区：QEMU 停靠的 hart 停在此处，不属于任何程序
+        return "unknown"
+    return _normalize_program_name(_CURRENT_USER_PROGRAM)
+
+
 def _current_program() -> str:
     """判定当前选中线程（命中 vCPU）所属程序：内核 or 事件驱动的当前用户程序。"""
     try:
         pc = _current_pc()
     except Exception:
         return "kernel"
-    if _in_addr_ranges(pc, _KERNEL_RANGES):
-        return "kernel"
-    return _normalize_program_name(_CURRENT_USER_PROGRAM)
+    return _classify_pc(pc)
 
 
 def _ensure_active_program() -> None:

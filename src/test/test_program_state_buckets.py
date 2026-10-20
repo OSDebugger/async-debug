@@ -148,6 +148,25 @@ def test_save_snapshots_label_bucket():
     return False
 
 
+def test_classify_pc():
+    """PC 分类：内核区间→kernel；复位向量区（停靠 hart）→unknown；用户区间→当前用户程序。"""
+    try:
+        f = rt._classify_pc
+    except AttributeError as e:
+        gdb.write(f"  FAIL: _classify_pc missing: {e}\n")
+        return False
+    rt._CURRENT_USER_PROGRAM = "hello_world"
+    ok = (f(0xFFFFFFC080200000) == "kernel"
+          and f(0x1000) == "unknown"
+          and f(0x10000) == "hello_world"
+          and f(0x0000004000000001) == "hello_world")  # 用户区间上界之外仍按用户（配置区间为准）
+    if ok:
+        gdb.write("  OK: pc classification (reset vector -> unknown)\n")
+        return True
+    gdb.write("  FAIL: pc classification wrong\n")
+    return False
+
+
 def main():
     gdb.write("[test] program state buckets\n")
     results = [
@@ -158,6 +177,7 @@ def main():
         ("save_snapshots_label_bucket", test_save_snapshots_label_bucket()),
         ("program_name_normalization", test_program_name_normalization()),
         ("in_addr_ranges", test_in_addr_ranges()),
+        ("classify_pc", test_classify_pc()),
     ]
     passed = sum(1 for _, ok in results if ok)
     failed = sum(1 for _, ok in results if not ok)
