@@ -1383,9 +1383,27 @@ export class GDBDebugSession extends DebugSession {
             this.sendEvent(new InitializedEvent());
         });
 
-        this.miDebugger!.on('breakpoint', (node: MINode) => {
+        // 统一记录停止事件上下文：线程号 + 断点号 + 待恢复断点的恢复时机。
+        // 注意 MI 层把停止分流到 breakpoint/step-end/step-other/signal-stop/stopped
+        // 五个事件——断点命中走 breakpoint 事件，此前只在 stopped 里记录断点号
+        // 导致防重入逻辑拿不到号（实测 bkpt=-，刷屏无法打破）。
+        const recordStopContext = (node: MINode): number => {
             const threadId = this.getThreadId(node);
             this.recentStopThreadId = threadId;
+            this.recentStopBkptNo = parseInt(node.record('bkptno') || '0') || undefined;
+            // 恢复此前临时禁用的断点（本次停止不是它们之一时恢复，避免重入循环）
+            if (this.pendingReenableBps.length > 0
+                && (!this.recentStopBkptNo || !this.pendingReenableBps.includes(this.recentStopBkptNo))) {
+                for (const n of this.pendingReenableBps) {
+                    this.miDebugger!.sendCliCommand(`enable ${n}`).catch(() => {});
+                }
+                this.pendingReenableBps = [];
+            }
+            return threadId;
+        };
+
+        this.miDebugger!.on('breakpoint', (node: MINode) => {
+            const threadId = recordStopContext(node);
             if (this.osDebugReady) {
                 const bkptno = node.record('bkptno') || '?';
                 console.log(`[ardb] breakpoint hit: bkptno=${bkptno}, state=${OSStates[this.osState.status]}`);
@@ -1397,8 +1415,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('step-end', (node: MINode) => {
-            const threadId = this.getThreadId(node);
-            this.recentStopThreadId = threadId;
+            const threadId = recordStopContext(node);
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1409,8 +1426,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('step-other', (node: MINode) => {
-            const threadId = this.getThreadId(node);
-            this.recentStopThreadId = threadId;
+            const threadId = recordStopContext(node);
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1421,8 +1437,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('signal-stop', (node: MINode) => {
-            const threadId = this.getThreadId(node);
-            this.recentStopThreadId = threadId;
+            const threadId = recordStopContext(node);
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1435,17 +1450,7 @@ export class GDBDebugSession extends DebugSession {
         });
 
         this.miDebugger!.on('stopped', (node: MINode) => {
-            const threadId = this.getThreadId(node);
-            this.recentStopThreadId = threadId;
-            this.recentStopBkptNo = parseInt(node.record('bkptno') || '0') || undefined;
-            // 恢复此前临时禁用的断点（本次停止不是它们之一时恢复，避免重入循环）
-            if (this.pendingReenableBps.length > 0
-                && (!this.recentStopBkptNo || !this.pendingReenableBps.includes(this.recentStopBkptNo))) {
-                for (const n of this.pendingReenableBps) {
-                    this.miDebugger!.sendCliCommand(`enable ${n}`).catch(() => {});
-                }
-                this.pendingReenableBps = [];
-            }
+            const threadId = recordStopContext(node);
             if (this.osDebugReady) {
                 this.osStateTransition(new OSEvent(OSEvents.STOPPED));
             } else {
@@ -1515,9 +1520,18 @@ export class GDBDebugSession extends DebugSession {
         } catch { /* best-effort：回退 hook 值 */ }
     }
 
+    /** TS 侧状态机诊断日志（多核排障用，写入 temp/ardb_ts_diag.log）。 */
+    private tsDiag(msg: string): void {
+        try {
+            fs.appendFileSync(path.join(this.tempDir, 'ardb_ts_diag.log'), msg + '\n');
+        } catch { /* best-effort */ }
+    }
+
     private osStateTransition(event: OSEvent): void {
         let actions: Action[];
+        const from = OSStates[this.osState.status];
         [this.osState, actions] = stateTransition(OSStateMachine, this.osState, event);
+        this.tsDiag(`[ts-diag] event=${OSEvents[event.type]} state=${from}->${OSStates[this.osState.status]} stopTid=${this.recentStopThreadId} bkpt=${this.recentStopBkptNo ?? '-'} lockTid=${this.singleStepThreadId ?? '-'} actions=${actions.map(a => DebuggerActions[a.type]).join(',') || '-'}`);
         actions.forEach(action => { this.doAction(action); });
     }
 
@@ -1617,6 +1631,7 @@ export class GDBDebugSession extends DebugSession {
             // 多核适配：单步序列只跟踪锁定线程；其他线程的停止静默继续
             // （外来断点临时禁用，防原地重入刷屏；序列结束后自动恢复）
             if (this.singleStepThreadId !== undefined && this.recentStopThreadId !== this.singleStepThreadId) {
+                this.tsDiag(`[ts-diag] foreign stop ignored (lockTid=${this.singleStepThreadId}, stopTid=${this.recentStopThreadId}, bkpt=${this.recentStopBkptNo ?? '-'})`);
                 if (this.recentStopBkptNo) {
                     this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
                     this.pendingReenableBps.push(this.recentStopBkptNo);
@@ -1647,6 +1662,7 @@ export class GDBDebugSession extends DebugSession {
             // 多核适配：单步序列只跟踪锁定线程；其他线程的停止静默继续
             // （外来断点临时禁用，防原地重入刷屏；序列结束后自动恢复）
             if (this.singleStepThreadId !== undefined && this.recentStopThreadId !== this.singleStepThreadId) {
+                this.tsDiag(`[ts-diag] foreign stop ignored (lockTid=${this.singleStepThreadId}, stopTid=${this.recentStopThreadId}, bkpt=${this.recentStopBkptNo ?? '-'})`);
                 if (this.recentStopBkptNo) {
                     this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
                     this.pendingReenableBps.push(this.recentStopBkptNo);
@@ -1866,6 +1882,7 @@ export class GDBDebugSession extends DebugSession {
                 if (fn && this.functionBorderNamesUtoK.some(name => fn.includes(name))) {
                     console.log(`[ardb] U→K border hit in kernel state (fn="${fn}") — internal call, continuing silently`);
                     if (this.recentStopBkptNo) {
+                        this.tsDiag(`[ts-diag] U→K-in-kernel: disable ${this.recentStopBkptNo} + continue`);
                         this.miDebugger!.sendCliCommand(`disable ${this.recentStopBkptNo}`).catch(() => {});
                         this.pendingReenableBps.push(this.recentStopBkptNo);
                     }
