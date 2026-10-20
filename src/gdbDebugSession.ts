@@ -1327,6 +1327,10 @@ export class GDBDebugSession extends DebugSession {
                     this.miDebugger!.sendCliCommand(`ardb-set-memory-ranges ${payload}`).catch(() => {});
                 }
 
+                // 特权级过渡期单步只放行目标 vCPU（其余保持冻结）；
+                // continue 不受 scheduler-locking 影响（all-stop 全停语义保持）。
+                this.miDebugger!.sendCliCommand('set scheduler-locking on').catch(() => {});
+
                 // Auto-insert function-name border breakpoints into GDB.
                 // These are the borders that drive the OS state machine (e.g. into_user, handle_syscall).
                 // They are inserted as raw function-name breakpoints and are transparent to the user.
