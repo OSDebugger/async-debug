@@ -1209,12 +1209,20 @@ def _on_new_objfile(event):
 # Breakpoints
 # -------------------------
 
+def _breakpoint_allowed(program: str) -> bool:
+    """断点程序门控：空归属（内核断点）= 放行；否则必须等于当前激活程序。"""
+    if not program:
+        return True
+    return program == _active_program
+
+
 class PollEntryBP(gdb.Breakpoint):
-    def __init__(self, location: str, poll_sym: str | None, internal: bool, temporary: bool = False):
+    def __init__(self, location: str, poll_sym: str | None, internal: bool, temporary: bool = False, program: str = ""):
         super().__init__(location, type=gdb.BP_BREAKPOINT, internal=internal, temporary=temporary)
         self.silent = True
         self.poll_sym = poll_sym or ""
         self.internal = internal
+        self.program = program
         _CREATED_BPS.append(self)
 
         # addr breakpoints / finish breakpoints are run-scoped
@@ -1224,6 +1232,14 @@ class PollEntryBP(gdb.Breakpoint):
     @_profiled("poll_entry")
     def stop(self) -> bool:
         t_s = _profile_now()
+        # 程序门控：先激活命中 vCPU 的程序桶，再核对断点归属；
+        # 交叉命中（多程序并行）静默继续，零错记。
+        try:
+            _ensure_active_program()
+        except Exception:
+            pass
+        if not _breakpoint_allowed(self.program):
+            return False
         fn = _current_function_name()
 
         # ---- coro context enter (best-effort) ----
@@ -1291,7 +1307,7 @@ class PollEntryBP(gdb.Breakpoint):
                     # whitelist enabled => only install if allowed
                     if (not _whitelist_enabled()) or _whitelist_allows_by_name(child_poll):
                         _ACTIVE_ROOTS.add(child_poll)
-                        PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False)
+                        PollEntryBP(child_poll, poll_sym=child_poll, internal=True, temporary=False, program=self.program)
 
         _profile_section("poll_entry", "awaitee", t_s)
         t_s = _profile_now()
@@ -1307,7 +1323,7 @@ class PollEntryBP(gdb.Breakpoint):
                 return False
 
             for a in call_sites:
-                CallSiteBP(a)
+                CallSiteBP(a, program=self.program)
 
             _CALLSITE_INSTALLED_FOR_FN.add(fn)
             _CALLSITE_ADDRS_BY_FN[fn] = list(call_sites)
@@ -1322,16 +1338,24 @@ class PollEntryBP(gdb.Breakpoint):
 
 
 class CallSiteBP(gdb.Breakpoint):
-    def __init__(self, addr: int):
+    def __init__(self, addr: int, program: str = ""):
         super().__init__(f"*{addr:#x}", type=gdb.BP_BREAKPOINT, internal=True)
         self.silent = True
         self.addr = addr
+        self.program = program
         _CREATED_BPS.append(self)
         _RUN_SCOPED_BPS.append(self)
 
     @_profiled("call_site")
     def stop(self) -> bool:
         t_s = _profile_now()
+        # 程序门控（与 PollEntryBP 同规则）
+        try:
+            _ensure_active_program()
+        except Exception:
+            pass
+        if not _breakpoint_allowed(self.program):
+            return False
         target = _resolve_call_target_from_asm(_current_asm())
         _profile_section("call_site", "asm+resolve", t_s)
         if not target:
@@ -1357,7 +1381,7 @@ class CallSiteBP(gdb.Breakpoint):
 
         if _is_pollish_name(callee) and callee not in _ACTIVE_ROOTS:
             _ACTIVE_ROOTS.add(callee)
-            PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False)
+            PollEntryBP(callee, poll_sym=callee, internal=True, temporary=False, program=self.program)
 
         return False
     
@@ -1386,7 +1410,7 @@ class ARDTraceCommand(gdb.Command):
             gdb.write(f"[ARD] warning: root not in whitelist: {sym}\n")
 
         _ACTIVE_ROOTS.add(sym)
-        PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
+        PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)  # launch 模式：无程序归属，不门控
         gdb.write(f"[ARD] trace root: {sym}\n")
 
 
@@ -1435,7 +1459,7 @@ class ARDTraceUserCrateCommand(gdb.Command):
             if sym in _ACTIVE_ROOTS:
                 continue
             _ACTIVE_ROOTS.add(sym)
-            PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False)
+            PollEntryBP(sym, poll_sym=sym, internal=False, temporary=False, program=crate)
             traced += 1
         gdb.write(
             f'[ARD] trace-user-crate {crate}: {traced} async symbols traced '
@@ -1951,11 +1975,11 @@ class ARDSaveTraceStateCommand(gdb.Command):
         _DIAG_LOG(f"[DIAG]   |_CREATED_BPS| = {len(_CREATED_BPS)}, PollEntryBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, PollEntryBP))}, CallSiteBP count = {sum(1 for bp in _CREATED_BPS if isinstance(bp, CallSiteBP))}")
 
         # Snapshot PollEntryBP metadata before group switch deletes them.
-        poll_entries: list[tuple[str, str, bool]] = []
+        poll_entries: list[tuple[str, str, bool, str]] = []
         for bp in list(_CREATED_BPS):
             if isinstance(bp, PollEntryBP):
                 poll_entries.append(
-                    (str(bp.location), bp.poll_sym, bp.internal)
+                    (str(bp.location), bp.poll_sym, bp.internal, getattr(bp, "program", ""))
                 )
 
         _DIAG_LOG(f"[DIAG]   saving {len(poll_entries)} PollEntryBP entries")
@@ -2135,13 +2159,19 @@ class ARDRestoreTraceStateCommand(gdb.Command):
 
         # 5. Re-install PollEntryBP for every saved entry.
         restored = 0
-        for location, poll_sym, internal in state["poll_entries"]:
+        for entry in state["poll_entries"]:
+            if len(entry) >= 4:
+                location, poll_sym, internal, program = entry[0], entry[1], entry[2], entry[3]
+            else:
+                location, poll_sym, internal = entry
+                program = ""
             try:
                 PollEntryBP(
                     location,
                     poll_sym=poll_sym,
                     internal=internal,
                     temporary=False,
+                    program=program,
                 )
                 restored += 1
             except Exception as e:
@@ -2157,7 +2187,7 @@ class ARDRestoreTraceStateCommand(gdb.Command):
             for addrs in state.get("callsite_addrs_by_fn", {}).values():
                 for a in addrs:
                     try:
-                        CallSiteBP(int(a))
+                        CallSiteBP(int(a), program=label)
                         callsite_restored += 1
                     except Exception:
                         pass
