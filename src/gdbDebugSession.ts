@@ -1327,9 +1327,11 @@ export class GDBDebugSession extends DebugSession {
                     this.miDebugger!.sendCliCommand(`ardb-set-memory-ranges ${payload}`).catch(() => {});
                 }
 
-                // 特权级过渡期单步只放行目标 vCPU（其余保持冻结）；
-                // continue 不受 scheduler-locking 影响（all-stop 全停语义保持）。
-                this.miDebugger!.sendCliCommand('set scheduler-locking on').catch(() => {});
+                // 特权级过渡期单步只放行目标 vCPU（其余保持冻结）。
+                // 注意必须用 "step" 模式而非 "on"：on 的语义是 continue 也只放行
+                // 当前线程——会把从核永久冻结在复位向量（SMP=2 真机实测发现，
+                // 内核忙等 hart 上线而死锁）。step 模式单步锁当前线程、continue 放行全部。
+                this.miDebugger!.sendCliCommand('set scheduler-locking step').catch(() => {});
 
                 // Auto-insert function-name border breakpoints into GDB.
                 // These are the borders that drive the OS state machine (e.g. into_user, handle_syscall).
