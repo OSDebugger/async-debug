@@ -1520,6 +1520,32 @@ export class GDBDebugSession extends DebugSession {
         } catch { /* best-effort：回退 hook 值 */ }
     }
 
+    /** K→U 边界命中后的处置：先读 sepc 分类。
+     * SMP=2 内核里 user_return 兼作内核任务的栈切换（sepc 指向内核续点）——
+     * 那不是真正的 K→U 切换，静默继续；sepc 指向用户才是真过渡。 */
+    private maybeEnterUserFromBorder(): void {
+        if (!this.miDebugger) { return; }
+        this.miDebugger.sendCommand('data-evaluate-expression "$sepc"').then(res => {
+            const sepcStr = res.result('value') || '';
+            const sepc = parseAddr(sepcStr);
+            if (sepc === undefined || !isUserAddr(sepc, this.userMemoryRanges)) {
+                this.tsDiag(`[ts-diag] K→U border hit but sepc=kernel (${sepcStr}) — kernel task switch, continuing silently`);
+                this.pendingBreakpointNode = undefined;
+                this.miDebugger!.continue();
+                return;
+            }
+            this.tsDiag(`[ts-diag] K→U border hit, sepc=user (${sepcStr}) — real transition`);
+            this.refreshNextGroupFromVcpuScan().then(() => {
+                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+            });
+        }).catch(() => {
+            // 读 sepc 失败：回退原行为（按真过渡处理）
+            this.refreshNextGroupFromVcpuScan().then(() => {
+                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
+            });
+        });
+    }
+
     /** TS 侧状态机诊断日志（多核排障用，写入 temp/ardb_ts_diag.log）。 */
     private tsDiag(msg: string): void {
         try {
@@ -1708,9 +1734,7 @@ export class GDBDebugSession extends DebugSession {
                     for (const border of borders) {
                         if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
                             matched = true;
-                            this.refreshNextGroupFromVcpuScan().then(() => {
-                                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
-                            });
+                            this.maybeEnterUserFromBorder();
                             break;
                         }
                     }
@@ -1864,9 +1888,7 @@ export class GDBDebugSession extends DebugSession {
                     for (const border of currentGroup.borders) {
                         if (this.matchesBorder({file: filepath, line: lineNumber, function: v[0].function}, border, 'kernel_to_user')) {
                             this.pendingBreakpointNode = undefined;
-                            this.refreshNextGroupFromVcpuScan().then(() => {
-                                this.osStateTransition(new OSEvent(OSEvents.AT_KERNEL_TO_USER_BORDER));
-                            });
+                            this.maybeEnterUserFromBorder();
                             return;
                         }
                     }
