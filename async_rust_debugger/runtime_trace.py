@@ -362,6 +362,48 @@ def _activate_program(name: str) -> None:
 
 
 # -------------------------
+# Program identity (event-driven + PC ranges)
+# -------------------------
+
+# 事件驱动：init_user hook 命中时由 TS 侧经 ardb-set-current-program 更新
+_CURRENT_USER_PROGRAM = "user"
+
+# 默认内存区间（与 launch.json 的 kernel_memory_ranges/user_memory_ranges 一致，
+# 可经 ardb-set-memory-ranges 覆盖）
+_KERNEL_RANGES = [(0xFFFFFFC000000000, 0xFFFFFFFFFFFFFFFF)]
+_USER_RANGES = [(0x0000000000000000, 0x0000004000000000)]
+
+
+def _normalize_program_name(name: str) -> str:
+    """去掉程序名前导斜杠（task 名常为 "/pipetest" 形式）。"""
+    s = name.strip()
+    return s[1:] if s.startswith("/") else s
+
+
+def _in_addr_ranges(pc: int, ranges) -> bool:
+    for lo, hi in ranges:
+        if lo <= pc <= hi:
+            return True
+    return False
+
+
+def _current_program() -> str:
+    """判定当前选中线程（命中 vCPU）所属程序：内核 or 事件驱动的当前用户程序。"""
+    try:
+        pc = _current_pc()
+    except Exception:
+        return "kernel"
+    if _in_addr_ranges(pc, _KERNEL_RANGES):
+        return "kernel"
+    return _normalize_program_name(_CURRENT_USER_PROGRAM)
+
+
+def _ensure_active_program() -> None:
+    """判定当前命中 vCPU 的程序并激活其状态桶（幂等，O(1) 早退）。"""
+    _activate_program(_current_program())
+
+
+# -------------------------
 # Low-level helpers
 # -------------------------
 
@@ -2138,6 +2180,43 @@ class ARDRestoreTraceStateCommand(gdb.Command):
         )
 
 
+class ARDSetCurrentProgramCommand(gdb.Command):
+    """Set the event-driven current user program name.
+    Usage: ardb-set-current-program <name>"""
+    def __init__(self):
+        super().__init__("ardb-set-current-program", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _CURRENT_USER_PROGRAM
+        name = arg.strip()
+        if not name:
+            gdb.write("[ARD] Usage: ardb-set-current-program <name>\n")
+            return
+        _CURRENT_USER_PROGRAM = _normalize_program_name(name)
+        gdb.write(f"[ARD] current user program set: {_CURRENT_USER_PROGRAM}\n")
+
+
+class ARDSetMemoryRangesCommand(gdb.Command):
+    """Set kernel/user memory ranges for program classification.
+    Usage: ardb-set-memory-ranges {"kernel": [[lo, hi], ...], "user": [[lo, hi], ...]}"""
+    def __init__(self):
+        super().__init__("ardb-set-memory-ranges", gdb.COMMAND_USER)
+
+    def invoke(self, arg, from_tty):
+        global _KERNEL_RANGES, _USER_RANGES
+        try:
+            payload = json.loads(arg)
+            k = payload.get("kernel")
+            u = payload.get("user")
+            if k:
+                _KERNEL_RANGES = [(int(lo, 0), int(hi, 0)) for lo, hi in k]
+            if u:
+                _USER_RANGES = [(int(lo, 0), int(hi, 0)) for lo, hi in u]
+            gdb.write(f"[ARD] memory ranges set: kernel={_KERNEL_RANGES} user={_USER_RANGES}\n")
+        except Exception as e:
+            gdb.write(f"[ARD] failed to parse memory ranges: {e}\n")
+
+
 class ARDResetTraceStateCommand(gdb.Command):
     """Discard saved trace state for a label.
     Usage: ardb-reset-trace-state <label>"""
@@ -2206,6 +2285,8 @@ def install():
     ARDSaveTraceStateCommand()
     ARDRestoreTraceStateCommand()
     ARDResetTraceStateCommand()
+    ARDSetCurrentProgramCommand()
+    ARDSetMemoryRangesCommand()
     ARDDiagCommand()
 
     if not _EVENTS_INSTALLED:

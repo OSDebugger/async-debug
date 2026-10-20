@@ -1318,6 +1318,15 @@ export class GDBDebugSession extends DebugSession {
                 this.osDebugReady = true;
                 this.inferiorStarted = true;
 
+                // 程序身份判定所需的内存区间同步给 Python 侧
+                if (attachConfig.kernel_memory_ranges || attachConfig.user_memory_ranges) {
+                    const payload = JSON.stringify({
+                        kernel: attachConfig.kernel_memory_ranges ?? null,
+                        user: attachConfig.user_memory_ranges ?? null,
+                    });
+                    this.miDebugger!.sendCliCommand(`ardb-set-memory-ranges ${payload}`).catch(() => {});
+                }
+
                 // Auto-insert function-name border breakpoints into GDB.
                 // These are the borders that drive the OS state machine (e.g. into_user, handle_syscall).
                 // They are inserted as raw function-name breakpoints and are transparent to the user.
@@ -1759,6 +1768,8 @@ export class GDBDebugSession extends DebugSession {
                         try {
                             const hookResult = await eval(hook.behavior)();
                             this.breakpointGroups!.setNextBreakpointGroup(hookResult);
+                            // 事件驱动的程序身份同步给 Python 侧（桶选择/断点门控依据）
+                            this.miDebugger!.sendCliCommand(`ardb-set-current-program ${hookResult}`).catch(() => {});
                             this.showInfo('hook matched, next group: ' + hookResult);
                         } catch (e: any) {
                             this.showInfo('hook eval failed: ' + (e?.message ?? e));

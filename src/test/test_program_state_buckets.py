@@ -83,12 +83,39 @@ def test_legacy_saved_state_migrates_or_rebuilds():
     return False
 
 
+def test_program_name_normalization():
+    ok = (rt._normalize_program_name("/pipetest") == "pipetest"
+          and rt._normalize_program_name("kernel") == "kernel"
+          and rt._normalize_program_name(" /hello ") == "hello")
+    if ok:
+        gdb.write("  OK: program name normalization\n")
+        return True
+    gdb.write("  FAIL: normalization wrong\n")
+    return False
+
+
+def test_in_addr_ranges():
+    kr = [(0xFFFFFFC000000000, 0xFFFFFFFFFFFFFFFF)]
+    ur = [(0x0, 0x4000000000)]
+    ok = (rt._in_addr_ranges(0xFFFFFFC080200000, kr) is True
+          and rt._in_addr_ranges(0x10400, kr) is False
+          and rt._in_addr_ranges(0x10400, ur) is True
+          and rt._in_addr_ranges(0x4000000001, ur) is False)
+    if ok:
+        gdb.write("  OK: addr range classification\n")
+        return True
+    gdb.write("  FAIL: range classification wrong\n")
+    return False
+
+
 def main():
     gdb.write("[test] program state buckets\n")
     results = [
         ("activate_swaps_state_between_programs", test_activate_swaps_state_between_programs()),
         ("activate_fresh_program_gets_empty_bucket", test_activate_fresh_program_gets_empty_bucket()),
         ("legacy_saved_state_migrates_or_rebuilds", test_legacy_saved_state_migrates_or_rebuilds()),
+        ("program_name_normalization", test_program_name_normalization()),
+        ("in_addr_ranges", test_in_addr_ranges()),
     ]
     passed = sum(1 for _, ok in results if ok)
     failed = sum(1 for _, ok in results if not ok)
