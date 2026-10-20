@@ -295,6 +295,73 @@ _SAVED_STATES: dict[str, dict] = {}
 
 
 # -------------------------
+# Per-program state buckets (O(1) context switch)
+# -------------------------
+
+_PROGRAM_STATES: dict[str, dict] = {}   # 程序名 -> 状态桶（内存引用交换，不序列化）
+_active_program: str | None = None      # 当前激活的程序名
+
+# 桶字段名 -> 全局变量名
+_BUCKET_GLOBALS = (
+    ("whitelist_exact", "_WHITELIST_EXACT"),
+    ("whitelist_prefix", "_WHITELIST_PREFIX"),
+    ("whitelist_addr_map", "_WHITELIST_ADDR_MAP"),
+    ("whitelist_addr_ready", "_WHITELIST_ADDR_READY"),
+    ("whitelist_objfile_names", "_WHITELIST_ADDR_OBJFILES"),
+    ("async_symbol_set", "_ASYNC_SYMBOL_SET"),
+    ("callsite_installed", "_CALLSITE_INSTALLED_FOR_FN"),
+    ("callsite_addrs_by_fn", "_CALLSITE_ADDRS_BY_FN"),
+    ("active_roots", "_ACTIVE_ROOTS"),
+    ("co_by_key", "_CO_BY_KEY"),
+    ("co_meta", "_CO_META"),
+    ("co_poll_seq", "_CO_POLL_SEQ"),
+    ("tls_stack", "_TLS_STACK"),
+    ("co_next_id", "_CO_NEXT_ID"),
+)
+
+
+def _new_bucket() -> dict:
+    """新建空状态桶。"""
+    return {
+        "whitelist_exact": None,
+        "whitelist_prefix": None,
+        "whitelist_addr_map": {},
+        "whitelist_addr_ready": False,
+        "whitelist_objfile_names": set(),
+        "async_symbol_set": None,
+        "callsite_installed": set(),
+        "callsite_addrs_by_fn": {},
+        "active_roots": set(),
+        "co_by_key": {},
+        "co_meta": {},
+        "co_poll_seq": {},
+        "tls_stack": {},
+        "co_next_id": 1,
+    }
+
+
+def _snapshot_bucket() -> dict:
+    """把当前全局状态收集为一个桶（引用交换，无序列化）。"""
+    return {k: globals()[g] for k, g in _BUCKET_GLOBALS}
+
+
+def _activate_program(name: str) -> None:
+    """O(1) 程序上下文切换：全局状态存回旧程序桶，装入目标程序桶。"""
+    global _active_program
+    if name == _active_program:
+        return
+    if _active_program is not None:
+        _PROGRAM_STATES[_active_program] = _snapshot_bucket()
+    _active_program = name
+    bucket = _PROGRAM_STATES.get(name)
+    if bucket is None:
+        bucket = _new_bucket()
+        _PROGRAM_STATES[name] = bucket
+    for k, g in _BUCKET_GLOBALS:
+        globals()[g] = bucket[k]
+
+
+# -------------------------
 # Low-level helpers
 # -------------------------
 
@@ -1356,6 +1423,9 @@ class ARDResetCommand(gdb.Command):
         _CALLSITE_ADDRS_BY_FN.clear()
         _ACTIVE_ROOTS.clear()
         _SAVED_STATES.clear()
+        global _active_program
+        _PROGRAM_STATES.clear()
+        _active_program = None
 
         _invalidate_whitelist_addrs()
 
@@ -1895,6 +1965,10 @@ class ARDSaveTraceStateCommand(gdb.Command):
             "co_next_id": _CO_NEXT_ID,
         }
         _SAVED_STATES[label] = state
+        # 桶同步：当前全局状态即该程序的状态（引用交换，无序列化）
+        global _active_program
+        _PROGRAM_STATES[label] = _snapshot_bucket()
+        _active_program = label
         _DIAG_LOG(f"[DIAG] ardb-save-trace-state '{label}': DONE. "
                   f"callsite_installed saved = {sorted(state['callsite_installed'])}")
         gdb.write(
@@ -2050,6 +2124,11 @@ class ARDRestoreTraceStateCommand(gdb.Command):
             _CALLSITE_INSTALLED_FOR_FN.clear()
             _CALLSITE_ADDRS_BY_FN.clear()
             _DIAG_LOG("[DIAG]   callsites NOT restored (delta!=0/unresolved) -> rescan on next poll")
+
+        # 桶同步：恢复后的全局状态存入该程序的桶（旧序列化格式由此迁移）
+        global _active_program
+        _PROGRAM_STATES[label] = _snapshot_bucket()
+        _active_program = label
 
         coro_count = len(_CO_BY_KEY)
         gdb.write(
