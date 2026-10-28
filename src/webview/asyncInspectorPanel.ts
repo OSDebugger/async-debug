@@ -41,7 +41,7 @@ export class AsyncInspectorPanel {
                         await this.handleSnapshot();
                         break;
                     case 'selectNode':
-                        await this.handleSelectNode(message.cid);
+                        await this.handleSelectNode(message);
                         break;
                     case 'locate':
                         await this.handleLocate(message.symbol);
@@ -162,34 +162,60 @@ export class AsyncInspectorPanel {
         }
     }
 
-    private async handleSelectNode(cid: number | null): Promise<void> {
-        if (cid === null || !this._debugSession) {
+    private async handleSelectNode(message: any): Promise<void> {
+        if (!this._debugSession) {
             return;
         }
 
-        const snapshot = this._lastSnapshot;
-        if (!snapshot) {
+        // 1. 树节点在快照合并时已持久化源码位置 —— 直接跳转。
+        //    对 async/sync 节点都成立，且不依赖"该节点是否还在最近一次
+        //    快照路径里"（旧节点同样可跳）。
+        const file = message?.fullname || message?.file;
+        const line = message?.line || 0;
+        if (file && line > 0) {
+            await this.handleSelectFrame(file, line);
             return;
         }
 
-        // Find the node in the snapshot path that matches this CID.
-        let targetNode: any = null;
-        for (let i = 0; i < snapshot.path.length; i++) {
-            const node = snapshot.path[i];
-            if (node.type === 'async' && node.cid === cid) {
-                targetNode = node;
-                break;
+        const cid = message?.cid;
+        if (cid !== null && cid !== undefined) {
+            // 2. 旧数据回退：按 CID 在最近一次快照路径里找源码位置。
+            const snapshot = this._lastSnapshot;
+            if (snapshot) {
+                for (let i = 0; i < snapshot.path.length; i++) {
+                    const node = snapshot.path[i];
+                    if (node.type === 'async' && node.cid === cid) {
+                        const filePath = node.fullname || node.file;
+                        const nodeLine = node.line || 0;
+                        if (filePath && nodeLine > 0) {
+                            await this.handleSelectFrame(filePath, nodeLine);
+                            return;
+                        }
+                        break;
+                    }
+                }
             }
         }
 
-        if (targetNode) {
-            // Prefer fullname (absolute path), fall back to file (relative path).
-            const filePath = targetNode.fullname || targetNode.file;
-            const line = targetNode.line || 0;
-            if (filePath && line > 0) {
-                await this.handleSelectFrame(filePath, line);
+        // 3. 同步节点没有源码位置时：用节点记录的 PC 问 GDB。
+        const addr = message?.addr;
+        if (addr) {
+            try {
+                const result = await this._debugSession.customRequest('ardb-execute-command', {
+                    command: `info line *${addr}`
+                });
+                const output = result?.result || '';
+                const match = output.match(/Line\s+(\d+)\s+of\s+"([^"]+)"/);
+                if (match) {
+                    await this.handleSelectFrame(match[2], parseInt(match[1], 10));
+                    return;
+                }
+            } catch (error) {
+                console.error('Failed to locate node address:', error);
             }
         }
+
+        vscode.window.showWarningMessage('No source info available for this node');
     }
 
     private async handleLocate(symbol: string): Promise<void> {
@@ -324,6 +350,9 @@ export class AsyncInspectorPanel {
                 poll: rootNode.poll,
                 state: rootNode.state,
                 space: (rootNode as any).space,
+                file: rootNode.file,
+                fullname: rootNode.fullname,
+                line: rootNode.line,
                 children: []
             };
             this._treeRoots.set(rootKey, root);
@@ -358,6 +387,9 @@ export class AsyncInspectorPanel {
                         poll: node.poll,
                         state: node.state,
                         space: (node as any).space,
+                        file: node.file,
+                        fullname: node.fullname,
+                        line: node.line,
                         children: [],
                     };
                     current.children.push(child);
@@ -381,6 +413,9 @@ export class AsyncInspectorPanel {
                         poll: node.poll,
                         state: node.state,
                         space: (node as any).space,
+                        file: node.file,
+                        fullname: node.fullname,
+                        line: node.line,
                         children: [],
                     };
                     current.children.push(child);
@@ -462,5 +497,8 @@ interface TreeNode {
     poll: number;
     state: number | string;
     space?: 'kernel' | 'user' | 'unknown';
+    file?: string;
+    fullname?: string;
+    line?: number;
     children: TreeNode[];
 }

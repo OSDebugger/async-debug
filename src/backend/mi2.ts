@@ -490,6 +490,14 @@ export class MI2 extends EventEmitter {
 		});
 	}
 
+	nextInstruction(reverse: boolean = false): Promise<boolean> {
+		return new Promise((resolve, reject) => {
+			this.sendCommand("exec-next-instruction" + (reverse ? " --reverse" : "")).then((info) => {
+				resolve(info.resultRecords?.resultClass == "running");
+			}, reject);
+		});
+	}
+
 	goto(filename: string, line: number): Promise<Boolean> {
 		return new Promise((resolve, reject) => {
 			const target: string = '"' + (filename ? escape(filename) + ":" : "") + line + '"';

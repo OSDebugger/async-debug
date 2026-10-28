@@ -357,10 +357,13 @@ export class GDBDebugSession extends DebugSession {
                 self.whitelistDirty = false;
             },
             sendCliCommandAndGetOutput(command: string): Promise<string> {
-                // 用 captureConsoleOutput 收集 console 流输出（getConsoleOutput 依赖的
-                // _consoleOutput 字段没有写入点，恒为空——审查发现 C1）。
+                // console 输出必须经 captureConsoleOutput 收集（sendCliCommand
+                // 的返回 MINode 不带 console 流输出——审查发现 C1）。
                 if (!self.miDebugger) { return Promise.resolve(''); }
                 return self.miDebugger.captureConsoleOutput(command).catch(() => '');
+            },
+            tsDiag(msg: string) {
+                self.tsDiag(msg);
             },
         };
 
@@ -488,6 +491,7 @@ export class GDBDebugSession extends DebugSession {
             } catch {
                 groupNames = [this.breakpointGroups.getCurrentBreakpointGroupName()];
             }
+            this.tsDiag(`[ts-diag] setBreakpoints file="${filePath}" groupNames=[${groupNames.join(', ')}] current="${this.breakpointGroups.getCurrentBreakpointGroupName()}" lines=[${requestedLines.map(b => b.line).join(', ')}]`);
 
             // Save into each matching group (for future group switches)
             for (const groupName of groupNames) {
@@ -703,6 +707,18 @@ export class GDBDebugSession extends DebugSession {
             await this.miDebugger!.next();
             this.sendResponse(response);
         } catch (err: any) {
+            // GDB 在优化代码上行表缺失/函数边界不可查时报 "Cannot find bounds
+            // of current function"——降级为指令级单步（release 构建常见）
+            if (err?.message?.includes('Cannot find bounds')) {
+                try {
+                    await this.miDebugger!.nextInstruction();
+                    this.sendEvent(new OutputEvent('[ardb] next failed ("Cannot find bounds of current function") — fell back to instruction-level next\n', 'console'));
+                    this.sendResponse(response);
+                } catch (err2: any) {
+                    this.sendErrorResponse(response, 5, err2.message);
+                }
+                return;
+            }
             this.sendErrorResponse(response, 5, err.message);
         }
     }
@@ -721,6 +737,18 @@ export class GDBDebugSession extends DebugSession {
             await this.miDebugger!.step();
             this.sendResponse(response);
         } catch (err: any) {
+            // 同 next：GDB 报 "Cannot find bounds of current function" 时降级为
+            // 指令级单步（-exec-step-instruction 不依赖行表/函数边界）
+            if (err?.message?.includes('Cannot find bounds')) {
+                try {
+                    await this.miDebugger!.stepInstruction();
+                    this.sendEvent(new OutputEvent('[ardb] step failed ("Cannot find bounds of current function") — fell back to instruction-level step\n', 'console'));
+                    this.sendResponse(response);
+                } catch (err2: any) {
+                    this.sendErrorResponse(response, 6, err2.message);
+                }
+                return;
+            }
             this.sendErrorResponse(response, 6, err.message);
         }
     }
@@ -896,8 +924,7 @@ export class GDBDebugSession extends DebugSession {
         const context = args.context || 'repl';
 
         try {
-            const record = await this.miDebugger!.sendCliCommand(expr);
-            const result = this.getConsoleOutput(record);
+            const result = await this.miDebugger!.captureConsoleOutput(expr);
 
             if (context === 'repl' && result) {
                 this.sendEvent(new OutputEvent(
@@ -1218,8 +1245,7 @@ export class GDBDebugSession extends DebugSession {
             return;
         }
         if (!this.miDebugger) { response.body = { groupedWhitelist: null }; this.sendResponse(response); return; }
-        const record = await this.miDebugger.sendCliCommand('ardb-get-whitelist-grouped');
-        const output = this.getConsoleOutput(record);
+        const output = await this.miDebugger.captureConsoleOutput('ardb-get-whitelist-grouped');
         const parsed = this.parseJsonFromOutput(output) as GroupedWhitelist | undefined;
         response.body = { groupedWhitelist: parsed || null };
         this.sendResponse(response);
@@ -1246,8 +1272,7 @@ export class GDBDebugSession extends DebugSession {
 
     private async handleArdInferTraceRoot(response: DebugProtocol.Response): Promise<void> {
         if (!this.miDebugger) { response.body = { inferredTraceRoot: null }; this.sendResponse(response); return; }
-        const record = await this.miDebugger.sendCliCommand('ardb-infer-trace-root');
-        const output = this.getConsoleOutput(record);
+        const output = await this.miDebugger.captureConsoleOutput('ardb-infer-trace-root');
         const result = this.parseJsonFromOutput(output) as InferredTraceRoot | undefined;
         response.body = { inferredTraceRoot: result || null };
         this.sendResponse(response);
@@ -1275,8 +1300,9 @@ export class GDBDebugSession extends DebugSession {
     private async handleArdExecuteCommand(response: DebugProtocol.Response, args: any): Promise<void> {
         if (!this.miDebugger) { response.body = { result: '' }; this.sendResponse(response); return; }
         const command = args?.command || '';
-        const record = await this.miDebugger.sendCliCommand(command);
-        const result = this.getConsoleOutput(record);
+        // sendCliCommand 的返回 MINode 不带 console 输出，必须用
+        // captureConsoleOutput 收集（handleLocate 依赖此输出解析行号）。
+        const result = await this.miDebugger.captureConsoleOutput(command);
         response.body = { result };
         this.sendResponse(response);
     }
@@ -2010,30 +2036,6 @@ export class GDBDebugSession extends DebugSession {
             // ignore read/parse errors
         }
         return undefined;
-    }
-
-    /** Extract console stream output accumulated by MI2 sendCliCommand result */
-    private getConsoleOutput(node: MINode): string {
-        // MI2's sendCliCommand collects console stream lines into resultRecords?.results
-        // via the consoleOutput mechanism — but our MI2 port doesn't expose that directly.
-        // The 'msg' field is set by the pending.consoleOutput join in handleResultRecord.
-        // Actually MINode.result('') won't work here because MINode uses a different structure.
-        // We need to get the raw console output that was collected.
-        // MI2.sendCommand accumulates consoleOutput and sets record.data.msg — but wait,
-        // we ported MI2 which does NOT use MIRecord — it uses MINode from mi_parse.
-        // The consoleOutput accumulation in code-debug's MI2 is done in handleResultRecord
-        // which we did NOT port (we use onOutput instead).
-        //
-        // We need to retrieve it differently. The CLI command output goes as console-stream
-        // records ('~"..."') which are emitted as 'msg' events with type 'console'.
-        // But we need to capture them synchronously per-command.
-        //
-        // Solution: use sendCommand with interpreter-exec directly and collect the console
-        // lines that arrive before the result record. We implement this via a buffered
-        // approach in sendCliCommandBuffered below.
-        if (!node) return '';
-        // The consoleOutput is stored in node via our patched sendCommand
-        return (node as any)._consoleOutput || '';
     }
 
     private parseJsonFromOutput(output: string): any | undefined {

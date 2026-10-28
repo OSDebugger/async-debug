@@ -48,6 +48,8 @@ export interface IBreakpointGroupsSession {
 	isWhitelistDirty?(): boolean;
 	clearWhitelistDirty?(): void;
 	sendCliCommandAndGetOutput?(command: string): Promise<string>;
+	// 写 temp/ardb_ts_diag.log 的排障通道（多核/断点链路排查用）。
+	tsDiag?(msg: string): void;
 	// OS-mode profiling (experiment B), null when disabled.
 	osProfiler?: OsProfiler | null;
 }
@@ -235,6 +237,7 @@ export class BreakpointGroups {
 		const newFuncBorders = (this.groups[newIndex].borders ?? []).filter(b => b.function !== undefined).map(b => b.function);
 		const newFuncHooks = [...this.groups[newIndex].hooks].filter(h => h.breakpoint.function !== undefined).map(h => h.breakpoint.function);
 		console.log('[ardb] ', `[DBG] switching to group "${newGroupName}": ${newBpCount} user BPs, func borders=[${newFuncBorders.join(', ')}], func hooks=[${newFuncHooks.join(', ')}]`);
+		this.session.tsDiag?.(`[ts-diag] switch-to group="${newGroupName}" newBpCount=${newBpCount} files=[${this.groups[newIndex].setBreakpointsArguments.map(a => a.source.path).join(', ')}]`);
 
 		// 1. Clear old group's breakpoints from GDB (parallel, order doesn't matter)
 		const clearOldPromises = this.groups[oldIndex].setBreakpointsArguments.map(
@@ -297,7 +300,10 @@ export class BreakpointGroups {
 									logMessage: brk.logMessage
 								});
 							});
-							return Promise.all(all);
+							return Promise.all(all).then(results => {
+								this.session.tsDiag?.(`[ts-diag] reinsert file="${path}" results=[${results.map(([ok, brk]) => `${ok ? 'OK' : (brk?.id ? 'PENDING' : 'FAIL')}#${brk?.id ?? '?'}`).join(', ')}]`);
+								return results;
+							});
 						},
 						(_msg) => [] as Array<[boolean, Breakpoint]>
 					);
