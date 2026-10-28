@@ -1,0 +1,16 @@
+{
+  "workspace": null,
+  "elf": "artifacts/starryos.elf",
+  "artifact_manifest": "artifacts/manifest.json",
+  "build_manifest": "temp/build-manifest.json",
+  "source_manifest": "temp/copied-files-sha256.json",
+  "poll_source": "source/os/arceos/modules/axtask/src/future/time.rs",
+  "boot_script": "boot_n_candidate.sh",
+  "openocd_launcher": null,
+  "source_prefix_maps": [],
+  "gdb_remote": "localhost:3333",
+  "telnet_port": 4444,
+  "tcl_port": 6666,
+  "poll_symbol": "ax_task::future::time::{impl#1}::poll",
+  "sleep_symbol": "ax_task::future::time::sleep_until::{async_fn#0}"
+}

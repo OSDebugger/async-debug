@@ -223,6 +223,9 @@ user_to_kernel
 
 ## 8. K3 COM260 真板调试链
 
+从启动 OS 到白名单、Trace、断点与视图操作，请阅读
+[ARD + K3 StarryOS N Host-DWARF 完整上手教程](testcases/k3-starryos/GETTING_STARTED.zh-CN.md)。
+
 当前项目已经将研究范围从 QEMU 扩展到真实 RISC-V SoC。
 
 真板基础链路：
@@ -243,17 +246,22 @@ RISC-V Debug Module
 StarryOS
 ```
 
-K3 + StarryOS 基础调试已经验证：
+K3 示例使用 StarryOS N Host-DWARF，覆盖以下检查项目：
 
 - Host-DWARF ELF
 - GDB remote connection
 - PC → Rust source mapping
 - Rust source breakpoint
-- source-level `next`
 - OpenOCD + J-Link + K3 JTAG
 - StarryOS 真板启动
 
 这部分工作用于进一步验证 ARD 在真实操作系统与真实硬件调试场景中的适用性。
+
+主机校验不代表完整真板回归通过。同步上下文、多级 Future 和多任务隔离仍待验证。
+N 的依赖准备、主机校验、A–G 判定标准及真板使用流程见
+[K3 testcase README](testcases/k3-starryos/README.md)。ARD 仅维护 N 单一 K3 示例；
+工作区通过 `STARRYOS_WORKSPACE` 或
+`--workspace` 指定，启动包装器转调已验证的 N 入口，不复制启动状态机。
 
 ---
 
