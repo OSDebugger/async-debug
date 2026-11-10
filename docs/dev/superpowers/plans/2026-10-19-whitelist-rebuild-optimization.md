@@ -17,7 +17,7 @@
 - 不引入宿主侧 ELF 解析依赖（不用 pyelftools）
 - 每层独立可验证、独立可回滚；OS 模式用户程序为 musl 静态链接 RISC-V
 - 白名单相关文件路径：`temp/poll_functions.txt`、`temp/poll_functions_grouped.json`（固定路径，UI 依赖）、新增缓存目录 `temp/whitelist_cache/`
-- 提交信息用中文，风格参照现有历史（如"fix：计时插桩bug"）；每条提交末尾加 `Co-Authored-By: Claude Code <noreply@anthropic.com>`
+- 提交信息用中文，风格参照现有历史（如"fix：计时插桩bug"）
 
 ## Review Focus
 
