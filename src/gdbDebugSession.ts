@@ -1322,7 +1322,7 @@ export class GDBDebugSession extends DebugSession {
 
         const env = { ...process.env, ASYNC_RUST_DEBUGGER_TEMP_DIR: this.tempDir };
 
-        this.miDebugger = new MI2(gdbPath, gdbArgs, attachConfig?.debugger_args || [], env);
+        this.miDebugger = this.createMI2(gdbPath, gdbArgs, attachConfig?.debugger_args || [], env);
 
         // Wire up events
         this.miDebugger!.on('msg', (type: string, msg: string) => {
@@ -1514,7 +1514,12 @@ export class GDBDebugSession extends DebugSession {
                 attachConfig.executable || '',
                 attachConfig.target,
                 attachConfig.autorun || [],
-            ).catch(err => {
+            ).then(() => {
+                // stopAtConnect:连接完成后暂停远程目标(真板 attach 时内核正在
+                // 运行,安装断点前必须先停住)。目标本就停止(如 QEMU -S)时
+                // -exec-interrupt 报错,吞掉即可——qemu 路径行为不变。
+                return this.haltRemoteTargetOnConnect(this.miDebugger!, attachConfig);
+            }).catch(err => {
                 console.error('[Adapter] MI2 connect error:', err);
             });
         } else {
@@ -1523,6 +1528,26 @@ export class GDBDebugSession extends DebugSession {
             this.miDebugger!.load(this.cwd, fullProgram, procArgsStr).catch(err => {
                 console.error('[Adapter] MI2 load error:', err);
             });
+        }
+    }
+
+    /** MI2 构造缝(测试注入用):默认行为与原先直接 new MI2 完全一致。 */
+    protected createMI2(gdbPath: string, gdbArgs: string[], debuggerArgs: string[], env: any): MI2 {
+        return new MI2(gdbPath, gdbArgs, debuggerArgs, env);
+    }
+
+    /** stopAtConnect:attach 连接完成后发 -exec-interrupt 暂停远程目标。
+     * 真板 attach 时内核正在运行,断点安装前必须先停住;目标本就停止
+     * (如 QEMU -S)时 GDB 报错,吞掉即可——qemu 路径行为不变。 */
+    protected async haltRemoteTargetOnConnect(
+        mi: { interrupt(): Promise<boolean> },
+        attachConfig?: AttachRequestArguments,
+    ): Promise<void> {
+        if (!attachConfig?.stopAtConnect) { return; }
+        try {
+            await mi.interrupt();
+        } catch {
+            // 目标已停止(如 QEMU -S):无事可做
         }
     }
 
