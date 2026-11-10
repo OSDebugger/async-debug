@@ -46,7 +46,7 @@
             }
           },
           "attach": {
-            "required": ["target", "cwd", "qemuPath", "qemuArgs"],
+            "required": ["target", "cwd"],
             "properties": {
               "target": {
                 "type": "string",

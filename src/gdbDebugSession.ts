@@ -93,8 +93,8 @@ export interface AttachRequestArguments extends DebugProtocol.AttachRequestArgum
     executable?: string;      // path to ELF for debug symbols
     autorun?: string[];
     stopAtConnect?: boolean;
-    qemuPath: string;
-    qemuArgs: string[];
+    qemuPath?: string;
+    qemuArgs?: string[];
     program_counter_id?: number;
     first_breakpoint_group?: string;
     second_breakpoint_group?: string;
@@ -262,11 +262,6 @@ export class GDBDebugSession extends DebugSession {
         const config = args as AttachRequestArguments;
         this.cwd = config.cwd || process.cwd();
 
-        if (!config.qemuPath || !config.qemuArgs?.length) {
-            this.sendErrorResponse(response, 103, '`qemuPath` and `qemuArgs` must be set in launch.json');
-            return;
-        }
-
         if (!fs.existsSync(this.tempDir)) {
             fs.mkdirSync(this.tempDir, { recursive: true });
         }
@@ -417,24 +412,30 @@ export class GDBDebugSession extends DebugSession {
             }
         }
 
-        // Launch QEMU in the integrated terminal, then start GDB after a short delay
-        // to give QEMU time to open the GDB stub on :1234.
-        const qemuCmd = [config.qemuPath, ...config.qemuArgs];
-        this.runInTerminalRequest(
-            { kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd },
-            15000,
-            (termResponse) => {
-                if (termResponse.success === false) {
-                    console.error('[ardb] Failed to launch QEMU in terminal');
-                    this.sendEvent(new TerminatedEvent());
-                    return;
+        // If a QEMU is configured, launch it in the integrated terminal and start
+        // GDB after a short delay to give QEMU time to open its GDB stub on :1234.
+        // Without QEMU (e.g. attaching to an external remote stub like OpenOCD on
+        // localhost:3333), connect GDB directly.
+        if (config.qemuPath && config.qemuArgs?.length) {
+            const qemuCmd = [config.qemuPath, ...config.qemuArgs];
+            this.runInTerminalRequest(
+                { kind: 'integrated', title: 'QEMU', cwd: this.cwd, args: qemuCmd },
+                15000,
+                (termResponse) => {
+                    if (termResponse.success === false) {
+                        console.error('[ardb] Failed to launch QEMU in terminal');
+                        this.sendEvent(new TerminatedEvent());
+                        return;
+                    }
+                    // Give QEMU ~1s to open the GDB stub before GDB tries to connect
+                    setTimeout(() => {
+                        this.launchGDB(config);
+                    }, 1000);
                 }
-                // Give QEMU ~1s to open the GDB stub before GDB tries to connect
-                setTimeout(() => {
-                    this.launchGDB(config);
-                }, 1000);
-            }
-        );
+            );
+        } else {
+            this.launchGDB(config);
+        }
 
         this.inferiorStarted = false;
         this.gdbReady = false;
@@ -1311,7 +1312,7 @@ export class GDBDebugSession extends DebugSession {
     // GDB subprocess management (via MI2)
     // -----------------------------------------------------------------------
 
-    private launchGDB(attachConfig?: AttachRequestArguments): void {
+    protected launchGDB(attachConfig?: AttachRequestArguments): void {
         const gdbPath = attachConfig?.gdbpath || 'gdb';
         const gdbArgs = [
             '--interpreter=mi2',
