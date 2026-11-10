@@ -542,6 +542,25 @@ class GoldenBoot:
         )
         self._set_state("DTB_LOADED")
 
+        # 真板跟踪暂停钩子:booti 前 U-Boot 停在提示符,内核+dtb 已装载。
+        # 此阶段 JTAG 链路安全(实板验证:同阶段 examine 成功),可在此设置
+        # 硬件触发器让内核异步代码自行冻结,不依赖 J-Link 在启动瞬间存活。
+        if os.environ.get("K3_PAUSE_BEFORE_BOOTI"):
+            release_file = os.environ.get(
+                "K3_PAUSE_RELEASE_FILE", "/tmp/k3_pause_release_booti"
+            )
+            self.log.emit(
+                f"[PAUSE] before booti: kernel+dtb staged, U-Boot at prompt. "
+                f"Create release file to proceed: {release_file}"
+            )
+            waited = 0
+            while not os.path.exists(release_file):
+                time.sleep(1)
+                waited += 1
+                if waited % 30 == 0:
+                    self.log.emit(f"[PAUSE] waiting for release file ({waited}s)…")
+            self.log.emit("[PAUSE] release file present → proceeding to booti")
+
         self.state = "ASYNCHOS_READY"
         booti_command = "booti 0x140000000 - 0x138000000"
         self.log.emit(f"[UART->] {booti_command}")
