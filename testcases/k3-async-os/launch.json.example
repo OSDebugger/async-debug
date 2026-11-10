@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "ardb",
+      "request": "attach",
+      "name": "K3 async-os Host-DWARF (JTAG+OpenOCD)",
+      "cwd": "${env:ASYNC_OS_WORKSPACE}",
+      "target": "localhost:3333",
+      "gdbpath": "gdb-multiarch",
+      "executable": "${env:ASYNC_OS_WORKSPACE}/artifacts/k3-host-dwarf/asyncos.elf",
+      "stopAtConnect": true,
+      "program_counter_id": 32,
+      "first_breakpoint_group": "kernel",
+      "second_breakpoint_group": "user",
+      "kernel_memory_ranges": [
+        ["0xffffffc000000000", "0xffffffffffffffff"]
+      ],
+      "user_memory_ranges": [
+        ["0x0000000000000000", "0x0000000040100000"]
+      ],
+      "border_breakpoints": [
+        { "function": "taskctx::arch::riscv::TrapFrame::user_return", "direction": "kernel_to_user" },
+        { "function": "trampoline::task_api::user_task_top::{async_fn#0}", "direction": "user_to_kernel" }
+      ]
+    }
+  ]
+}
