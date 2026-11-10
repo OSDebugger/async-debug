@@ -1,0 +1,12 @@
+config/baseline.env
+logs/
+artifacts/
+*.bin
+*.itb
+*.elf
+*.dtb
+
+# OpenOCD target configuration is source, not a Rust build target.
+!openocd/target/
+openocd/target/*
+!openocd/target/spacemit-k3.cfg
