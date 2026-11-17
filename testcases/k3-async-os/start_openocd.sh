@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# 清掉可能残留的 OpenOCD 实例：一个 J-Link 一个板子，只允许一个实例，
+# 残留实例会占住 6666/4444/3333 端口，导致新实例起不来。
+# 实测 OpenOCD 不响应 SIGTERM（疑似卡在 jaylink USB 层），必须用 -9 强杀。
+# 注意：如果调试会话正连着 OpenOCD，这里会把它一起杀掉，重起后重新 F5 即可。
+pkill -9 -x openocd 2>/dev/null || true
+sleep 0.5
+
 testcase_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 openocd_bin=${K3_OPENOCD_BIN:-openocd}

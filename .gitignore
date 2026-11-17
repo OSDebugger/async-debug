@@ -1,6 +1,7 @@
 # ignore all target dirs anywhere
 target/
 /out
+dev_docs/
 
 # ignore all python cache folders
 __pycache__/

@@ -447,8 +447,7 @@ class GoldenBoot:
 
         self._wait_uart_sequence(
             [
-                (b"U-Boot SPL 2022.10-dirty", "U-Boot SPL 2022.10-dirty"),
-                (b"Debug JTAG enabled on MMC1 pins", "Debug JTAG enabled on MMC1 pins"),
+                (b"U-Boot SPL 2022.10", "U-Boot SPL 2022.10 banner"),
             ],
             spl_boundary,
             self.timeouts.spl_uart,
@@ -456,8 +455,8 @@ class GoldenBoot:
         spl_selector, _ = self._wait_fastboot(
             timeout=self.timeouts.reenumeration,
             variable="version",
-            expected=re.compile(r"version:\s*0\.4(?:\s|$)"),
-            expected_text="re-enumerated SPL fastboot gadget with version: 0.4",
+            expected=re.compile(r"version:\s*[0-9]+(?:\.[0-9]+)*(?:\s|$)"),
+            expected_text="re-enumerated SPL fastboot gadget (any version)",
         )
         self._set_state("SPL_READY")
 
@@ -549,6 +548,11 @@ class GoldenBoot:
             release_file = os.environ.get(
                 "K3_PAUSE_RELEASE_FILE", "/tmp/k3_pause_release_booti"
             )
+            # 清掉上次运行可能残留的 release 文件：它是一张一次性通行证，
+            # 不清理的话本次到达 P1 会被直接放行，暂停失效。
+            if os.path.exists(release_file):
+                os.remove(release_file)
+                self.log.emit(f"[PAUSE] removed stale release file: {release_file}")
             self.log.emit(
                 f"[PAUSE] before booti: kernel+dtb staged, U-Boot at prompt. "
                 f"Create release file to proceed: {release_file}"
@@ -575,7 +579,7 @@ class GoldenBoot:
         self.log.emit("[UART] handing over to minicom")
 
     def _preflight(self) -> None:
-        for command in ("fastboot", "sudo", "minicom"):
+        for command in ("fastboot", "minicom"):
             if shutil.which(command) is None:
                 raise FlowError(f"{command} not found in PATH", f"{command} executable")
         if not self.uart.device.exists():
@@ -872,14 +876,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log.close()
         return exit_code
 
-    minicom_argv = ["sudo", "minicom", "-o", "-D", str(uart.device), "-b", str(uart.baud)]
+    minicom_argv = ["minicom", "-o", "-D", str(uart.device), "-b", str(uart.baud)]
     log.command(minicom_argv)
     log.close()
     try:
-        os.execvp("sudo", minicom_argv)
+        os.execvp("minicom", minicom_argv)
     except OSError as exc:
         print(f"[FAILED] state=MINICOM_HANDOFF", file=sys.stderr)
-        print(f"[FAILED] expected=exec sudo minicom on {uart.device}", file=sys.stderr)
+        print(f"[FAILED] expected=exec minicom on {uart.device}", file=sys.stderr)
         print(f"[FAILED] error={exc}", file=sys.stderr)
         return 1
     return exit_code

@@ -4,25 +4,51 @@
     {
       "type": "ardb",
       "request": "attach",
-      "name": "K3 async-os Host-DWARF (JTAG+OpenOCD)",
+      "name": "K3 async-os (JTAG+OpenOCD)",
       "cwd": "${env:ASYNC_OS_WORKSPACE}",
       "target": "localhost:3333",
       "gdbpath": "gdb-multiarch",
-      "executable": "${env:ASYNC_OS_WORKSPACE}/artifacts/k3-host-dwarf/asyncos.elf",
-      "stopAtConnect": true,
-      "program_counter_id": 32,
+      "executable": "${env:ASYNC_OS_WORKSPACE}/apps/user_boot/user_boot_riscv64-k3.elf",
       "first_breakpoint_group": "kernel",
-      "second_breakpoint_group": "user",
+      "second_breakpoint_group": "pipetest",
+      "stopAtConnect": true,
+      // F5 时自动预埋 rust_entry 硬件触发（P2 断链自停保险）。
+      // 地址必须与 ELF 里 rust_entry 的实际地址一致。
+      "autorun": [
+        "monitor halt",
+        "monitor bp 0xffffffc140015bce 4 hw",
+        "monitor resume"
+      ],
+      "program_counter_id": 32,
       "kernel_memory_ranges": [
         ["0xffffffc000000000", "0xffffffffffffffff"]
       ],
       "user_memory_ranges": [
-        ["0x0000000000000000", "0x0000000040100000"]
+        ["0x0000000000000000", "0x0000004000000000"]
       ],
       "border_breakpoints": [
         { "function": "taskctx::arch::riscv::TrapFrame::user_return", "direction": "kernel_to_user" },
         { "function": "trampoline::task_api::user_task_top::{async_fn#0}", "direction": "user_to_kernel" }
-      ]
+      ],
+      "hook_breakpoints": [
+        {
+          "breakpoint": { "function": "trampoline::executor_api::init_user" },
+          "behavior": {
+            "functionArguments": "",
+            "functionBody": "try { await this.miDebugger.captureConsoleOutput('set language c'); const out = await this.miDebugger.captureConsoleOutput('x/s *((unsigned long long*)(args.buf.inner.ptr.pointer.pointer)+1)'); const m = /0x[0-9a-f]+:\\s*\"(.*)\"/.exec(out); return m ? m[1] : 'user'; } catch(e) { return 'user'; }",
+            "isAsync": true
+          }
+        }
+      ],
+      "filePathToBreakpointGroupNames": {
+        "functionArguments": "filepath",
+        "functionBody": "const m = /user_apps\\/([^\\/]+)\\//.exec(filepath); if (m) return [m[1]]; return ['kernel'];",
+        "isAsync": false
+      },
+      "breakpointGroupNameToDebugFilePaths": {
+        "functionArguments": "groupName",
+        "functionBody": "if (groupName === 'kernel') return []; const fs = require('fs'); const path = require('path'); const dir = 'user_apps/target/riscv64gc-unknown-linux-musl/release/'; if (fs.existsSync(dir)) { const files = fs.readdirSync(dir).filter(f => f === groupName); if (files.length > 0) return [path.join(dir, files[0])]; } return [path.join(dir, groupName)];"
+      }
     }
   ]
 }
