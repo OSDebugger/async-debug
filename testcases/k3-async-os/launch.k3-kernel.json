@@ -1,0 +1,33 @@
+{
+  // K3 内核态调试基线配置（快照）。
+  // 这是内核态协程调试实际生效的配置，与 async-os-original 主仓库 .vscode/launch.json
+  // 里的 "K3 async-os Host-DWARF (JTAG+OpenOCD)" 项一致（绝对路径换成 ${workspaceFolder}）。
+  //
+  // 用法：把下面这一项放进扩展宿主窗口所开工作区（async-os-original）的 .vscode/launch.json。
+  // 前提：该工作区已构建出 apps/coroutine_test/coroutine_test_riscv64-k3.elf，
+  //       且源码与构建输入一致（见 docs/dev/K3内核态远程调试复现手册.md）。
+  //
+  // 注意：本配置不含 autorun。rust_entry 硬件触发（P2）在 F5 之前用 gdb batch 手动预埋，
+  //       步骤见复现手册第 4 节。触发地址随构建变化，须从 ELF 重新解析。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "ardb",
+      "request": "attach",
+      "name": "K3 async-os Host-DWARF (JTAG+OpenOCD)",
+      "cwd": "${workspaceFolder}",
+      "target": "localhost:3333",
+      "gdbpath": "gdb-multiarch",
+      "executable": "${workspaceFolder}/apps/coroutine_test/coroutine_test_riscv64-k3.elf",
+      "program_counter_id": 32,
+      "first_breakpoint_group": "kernel",
+      "second_breakpoint_group": "user",
+      "kernel_memory_ranges": [
+        ["0xffffffc000000000", "0xffffffffffffffff"]
+      ],
+      "user_memory_ranges": [
+        ["0x0000000000000000", "0x0000000040000000"]
+      ]
+    }
+  ]
+}

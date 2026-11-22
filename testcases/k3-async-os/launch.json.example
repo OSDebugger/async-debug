@@ -8,15 +8,18 @@
       "cwd": "${env:ASYNC_OS_WORKSPACE}",
       "target": "localhost:3333",
       "gdbpath": "gdb-multiarch",
-      "executable": "${env:ASYNC_OS_WORKSPACE}/apps/user_boot/user_boot_riscv64-k3.elf",
+      "executable": "${env:ASYNC_OS_WORKSPACE}/apps/coroutine_test/coroutine_test_riscv64-k3.elf",
       "first_breakpoint_group": "kernel",
       "second_breakpoint_group": "pipetest",
       "stopAtConnect": true,
       // F5 时自动预埋 rust_entry 硬件触发（P2 断链自停保险）。
-      // 地址必须与 ELF 里 rust_entry 的实际地址一致。
+      // 地址必须与 ELF 里 rust_entry 的实际地址一致，随构建变化。
+      // 下面的 0xffffffc14000406e 是 coroutine_test 基线（commit 31a327d）的实测值。
+      // 重新解析：gdb-multiarch -batch -ex 'file <ELF>' -ex 'x/i 0xffffffc14000406e'
+      // 或 objdump -d <ELF> | grep rust_entry，取函数首条指令地址。
       "autorun": [
         "monitor halt",
-        "monitor bp 0xffffffc140015bce 4 hw",
+        "monitor bp 0xffffffc14000406e 4 hw",
         "monitor resume"
       ],
       "program_counter_id": 32,

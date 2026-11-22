@@ -1,0 +1,13 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0bb9712..855e115 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,7 @@ pub use getbitmap::__vdso_gettimeofday;
+ mod lang_item {
+ 
+     #[lang = "eh_personality"]
+-    #[no_mangle]
++    
+     fn rust_eh_personality() {}
+ 
+     #[panic_handler]

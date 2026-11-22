@@ -12,3 +12,6 @@ __pycache__/
 # ignore temp folder
 /temp
 
+# Obsidian 编辑器配置（本地杂物，不进库）
+docs/.obsidian/
+
